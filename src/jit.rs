@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::fmt::Formatter;
 use std::fmt::Error as FormatterError;
 use std::ops::{Index, IndexMut};
+use rand::{rngs::ThreadRng, Rng};
 
 use crate::{
     vm::{Config, Executable, ProgramResult, InstructionMeter, Tracer, DynTraitFatPointer, SYSCALL_CONTEXT_OBJECTS_OFFSET},
@@ -122,6 +123,10 @@ impl<E: UserDefinedError, I: InstructionMeter> JitProgram<E, I> {
         })
     }
 }
+
+// Used for code randomization and defines how many
+// additional NoOps per instruction will be emitted on average.
+const INSTRUCTION_NOOP_RATIO: f64 = 1.0 / 128.0;
 
 // Special values for target_pc in struct Jump
 const TARGET_PC_TRACE: usize = std::usize::MAX - 13;
@@ -547,6 +552,16 @@ impl X86Instruction {
         Self {
             size: OperandSize::S32,
             opcode: 0xc3,
+            modrm: false,
+            ..Self::default()
+        }
+    }
+
+    /// No operation
+    fn noop() -> Self {
+        Self {
+            size: OperandSize::S32,
+            opcode: 0x90,
             modrm: false,
             ..Self::default()
         }
@@ -1072,6 +1087,7 @@ struct JitCompiler {
     program_vm_addr: u64,
     handler_anchors: HashMap<usize, usize>,
     config: Config,
+    rng: ThreadRng,
 }
 
 impl Index<usize> for JitCompiler {
@@ -1134,6 +1150,7 @@ impl JitCompiler {
             program_vm_addr: 0,
             handler_anchors: HashMap::new(),
             config: *_config,
+            rng: rand::thread_rng(),
         }
     }
 
@@ -1156,6 +1173,10 @@ impl JitCompiler {
             let insn = ebpf::get_insn(program, self.pc);
 
             self.result.pc_section[self.pc] = self.offset_in_text_section as u64;
+
+            if self.config.enable_code_randomization && self.rng.gen_bool(INSTRUCTION_NOOP_RATIO) {
+                X86Instruction::noop().emit(self)?;
+            }
 
             if self.config.enable_instruction_tracing {
                 X86Instruction::load_immediate(OperandSize::S64, R11, self.pc as i64).emit(self)?;
