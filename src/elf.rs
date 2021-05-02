@@ -366,6 +366,7 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EBpfElf<E, I> {
             return Err(ElfError::InvalidEntrypoint);
         }
         let entrypoint = offset as usize / ebpf::INSN_SIZE;
+        println!("Entrypoint: {}", entrypoint);
 
         // calculate the text section info
         let text_section_info = SectionInfo {
@@ -406,6 +407,7 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EBpfElf<E, I> {
                 return Err(ElfError::OutOfBounds);
             }
         }
+        println!("Loaded");
 
         Ok(Self {
             config,
@@ -445,7 +447,7 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EBpfElf<E, I> {
                     ));
                 }
 
-                insn.imm = hash as i32;
+                insn.imm = hash as i64;
                 let checked_slice = elf_bytes
                     .get_mut(i * ebpf::INSN_SIZE..(i * ebpf::INSN_SIZE) + ebpf::INSN_SIZE)
                     .ok_or(ElfError::OutOfBounds)?;
@@ -544,11 +546,17 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EBpfElf<E, I> {
         )?;
 
         // Fixup all the relocations in the relocation section if exists
+        println!("Relocating");
         for relocation in &elf.dynrels {
-            let r_offset = relocation.r_offset as usize;
+            println!("{:?}", relocation);
+            let mut r_offset = relocation.r_offset as usize;
+            println!("r_offset: {}", r_offset);
+            r_offset -= 4096;
 
             // Offset of the immediate field
-            let imm_offset = r_offset.saturating_add(BYTE_OFFSET_IMMEDIATE);
+            let mut imm_offset = r_offset.saturating_add(BYTE_OFFSET_IMMEDIATE);
+            //imm_offset -= 4096; // Adjust hex address to byte index; -16^3
+            println!("{}", imm_offset);
             match BpfRelocationType::from_x86_relocation_type(relocation.r_type) {
                 Some(BpfRelocationType::R_Bpf_64_Relative) => {
                     // Raw relocation between sections.  The instruction being relocated contains
@@ -557,11 +565,13 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EBpfElf<E, I> {
 
                     // Read the instruction's immediate field which contains virtual
                     // address to convert to physical
+                    println!("HERE");
+                    println!("Elf len: {}", elf_bytes.len());
                     let checked_slice = elf_bytes
                         .get(imm_offset..imm_offset.saturating_add(BYTE_LENGTH_IMMEIDATE))
                         .ok_or(ElfError::OutOfBounds)?;
                     let refd_va = LittleEndian::read_u32(&checked_slice) as u64;
-
+                    println!("refda_va: {:?}", refd_va);
                     if refd_va == 0 {
                         return Err(ElfError::InvalidVirtualAddress(refd_va));
                     }
@@ -575,6 +585,7 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EBpfElf<E, I> {
                     // );
 
                     // Write the physical address back into the target location
+                    println!("THERE");
                     if text_section.file_range().contains(&r_offset) {
                         // Instruction lddw spans two instruction slots, split the
                         // physical address into a high and low and write into both slot's imm field
@@ -787,8 +798,8 @@ mod test {
             opc: 0x85,
             dst: 0,
             src: 1,
-            off: 0,
-            imm: key as i32,
+            imm: key as i64,
+            ..ebpf::Insn::default()
         };
         assert_eq!(insn.to_array(), prog[40..]);
         assert_eq!(*calls.get(&key).unwrap(), 4);
@@ -802,8 +813,8 @@ mod test {
             opc: 0x85,
             dst: 0,
             src: 1,
-            off: 0,
-            imm: key as i32,
+            imm: key as i64,
+            ..ebpf::Insn::default()
         };
         assert_eq!(insn.to_array(), prog[40..]);
         assert_eq!(*calls.get(&key).unwrap(), 0);
@@ -828,8 +839,8 @@ mod test {
             opc: 0x85,
             dst: 0,
             src: 1,
-            off: 0,
-            imm: key as i32,
+            imm: key as i64,
+            ..ebpf::Insn::default()
         };
         assert_eq!(insn.to_array(), prog[..8]);
         assert_eq!(*calls.get(&key).unwrap(), 1);
@@ -843,8 +854,8 @@ mod test {
             opc: 0x85,
             dst: 0,
             src: 1,
-            off: 0,
-            imm: key as i32,
+            imm: key as i64,
+            ..ebpf::Insn::default()
         };
         assert_eq!(insn.to_array(), prog[..8]);
         assert_eq!(*calls.get(&key).unwrap(), 5);
@@ -872,8 +883,8 @@ mod test {
             opc: 0x85,
             dst: 0,
             src: 1,
-            off: 0,
-            imm: key as i32,
+            imm: key as i64,
+            ..ebpf::Insn::default()
         };
         assert_eq!(insn.to_array(), prog[..8]);
         assert_eq!(*calls.get(&key).unwrap(), 1);
@@ -901,8 +912,8 @@ mod test {
             opc: 0x85,
             dst: 0,
             src: 1,
-            off: 0,
-            imm: key as i32,
+            imm: key as i64,
+            ..ebpf::Insn::default()
         };
         assert_eq!(insn.to_array(), prog[40..]);
         assert_eq!(*calls.get(&key).unwrap(), 4);
