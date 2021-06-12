@@ -9,8 +9,8 @@ We are using the file tests/elfs/test_simple_add.c for debugging (only 12 instru
     - cd binutils-gdb
     - ./configure bpf
     - make    
-(2+3 can be skipped, the files are already in tests/elfs directory)
-2. Compile tests/elfs/test_simple_add.c for gdb usage:
+2. (2+3 can be skipped, the files are already in tests/elfs directory)
+Compile tests/elfs/test_simple_add.c for gdb usage:
     - cd tests/elfs
     - clang-12 -O2 -g -emit-llvm -c test_simple_add.c -o - | llc-12 -march=bpf -filetype=obj -o test_simple_add_gdb.o
      - strip conflicting elf sections with ./strip_elf.sh (using llvm-objcopy-12)
