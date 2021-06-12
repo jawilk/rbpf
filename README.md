@@ -1,4 +1,41 @@
-# solana_rbpf
+# solana_rbpf (gdb)
+
+Simple poc for attaching gdb to rbpf vm. This is very experimental and not all gdb features are supported (see 6). Most code architecture was already done here (see branches) https://github.com/Sladuca/rbpf/tree/main and described here https://github.com/solana-labs/solana/issues/14756
+Only gdb needs to be downloaded and compiled, the other files are in tests/elfs.
+We are using the file tests/elfs/test_simple_add.c for debugging (only 12 instructions)
+1. Compile gdb with bpf target support:
+    - git clone git://sourceware.org/git/binutils-gdb.git
+    - cd binutils-gdb
+    - ./configure bpf
+    - make    
+(2+3 can be skipped, the files are already in tests/elfs directory)
+2. Compile tests/elfs/test_simple_add.c for gdb usage:
+    - cd tests/elfs
+    - clang-12 -O2 -g -emit-llvm -c test_simple_add.c -o - | llc-12 -march=bpf -filetype=obj -o test_simple_add_gdb.o
+https://twitter.com/qeole/status/1291026052953911296
+     - strip conflicting elf sections with ./strip_elf.sh (using llvm-objcopy-12)
+ 3. Compile tests/elfs/test_simple_add.c for vm usage:
+     The following paths do not exist in this repo. I cannot find the current once but the compiled files are already there
+     (Taken from https://github.com/solana-labs/rbpf/blob/main/tests/elfs/elfs.sh)
+     - /solana/sdk/bpf/dependencies/bpf-tools/llvm/bin/clang -Werror -target bpf -O2 -fno-builtin -fPIC -o test_simple_add_vm.o -c test_simple_add.c
+     - /solana/sdk/bpf/dependencies/bpf-tools/llvm/bin/ld.lld -z
+notext -shared --Bdynamic -entry entrypoint -o test_simple_add_vm.so test_simple_add_vm.o
+4. Start vm with debugging support:
+    - cargo run --example test_gdb --features debug
+5. Start gdb
+    - ./gdb/gdb test_simple_add_gdb.o (in tests/elfs)
+    - (gdb) set disassemble-next-line on
+    - (gdb) target remote :9001
+6. Debugging
+     - (gdb) stepi/step - for instruction or line stepping
+     - (gdb) i r - print registers + sp + pc
+     - (gdb) i locals - print all variables in current scope (if not optimized out)
+     - Breakpoint on instruction address - (gdb) b *0x20
+     - Breakpoint on line - (gdb) b <line_nr>
+     - (gdb) i func - list all available functions
+     - (gdb) b <func_name> - set breakpoint at function entry
+     - (gdb) set $<register_nr> = < value >    - edit register value (the test always expects return 5 so changing regs will return an error at the very end)
+  
 
 ![](misc/rbpf_256.png)
 
