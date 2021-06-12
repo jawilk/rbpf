@@ -253,7 +253,7 @@ impl Registers for BpfRegs {
 pub struct BpfRegId(u8);
 impl RegId for BpfRegId {
     fn from_raw_id(id: usize) -> Option<(Self, usize)> {
-        println!("FROM RAW IDDDDDDDD");
+        println!("FROM RAW ID");
         if id < 13 {
             Some((BpfRegId(id as u8), 64))
         } else {
@@ -494,7 +494,7 @@ impl SingleRegisterAccess<()> for DebugServer {
         reg_id: BpfRegId,
         dst: &mut [u8],
     ) -> TargetResult<(), Self> {
-        println!("READ SIIIINGLE REGISTER");
+        println!("READ SINGLE REGISTER");
         self.req.send(VmRequest::ReadReg(reg_id.into())).unwrap();
         match self.reply.recv().unwrap() {
             VmReply::ReadReg(val) => {
