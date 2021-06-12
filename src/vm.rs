@@ -24,7 +24,7 @@ use crate::{
     user_error::UserError,
     verifier::VerifierError,
 };
-#[cfg(feature = "debug")]
+//#[cfg(feature = "debug")]
 //use gdbstub::target::ext::section_offsets::Offsets;
 use log::debug;
 #[cfg(feature = "debug")]

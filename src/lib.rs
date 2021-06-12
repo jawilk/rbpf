@@ -9,7 +9,7 @@
 // copied, modified, or distributed except according to those terms.
 
 //! Virtual machine and JIT compiler for eBPF programs.
-#![warn(missing_docs)]
+//#![warn(missing_docs)]
 #![doc(
     html_logo_url = "https://raw.githubusercontent.com/qmonnet/rbpf/master/misc/rbpf.png",
     html_favicon_url = "https://raw.githubusercontent.com/qmonnet/rbpf/master/misc/rbpf.ico"
@@ -35,8 +35,12 @@ pub mod fuzz;
 pub mod insn_builder;
 mod jit;
 pub mod memory_region;
+pub mod static_analysis;
 pub mod syscalls;
 pub mod user_error;
 pub mod verifier;
 pub mod vm;
 mod x86;
+
+#[cfg(feature = "debug")]
+mod gdb_stub;

@@ -133,6 +133,7 @@ impl X86Instruction {
                 }
             }
         }
+        jit.emit_random_noop()?;
         if self.size == OperandSize::S16 {
             emit::<u8, E>(jit, 0x66)?;
         }
@@ -214,6 +215,42 @@ impl X86Instruction {
         }
     }
 
+    /// Test source and destination
+    pub fn test(
+        size: OperandSize,
+        source: u8,
+        destination: u8,
+        indirect: Option<X86IndirectAccess>,
+    ) -> Self {
+        Self {
+            size,
+            opcode: 0x85,
+            first_operand: source,
+            second_operand: destination,
+            indirect,
+            ..Self::default()
+        }
+    }
+
+    /// Test immediate and destination
+    pub fn test_immediate(
+        size: OperandSize,
+        destination: u8,
+        immediate: i64,
+        indirect: Option<X86IndirectAccess>,
+    ) -> Self {
+        Self {
+            size,
+            opcode: 0xf7,
+            first_operand: RAX,
+            second_operand: destination,
+            immediate_size: OperandSize::S32,
+            immediate,
+            indirect,
+            ..Self::default()
+        }
+    }
+
     /// Compare source and destination
     pub fn cmp(
         size: OperandSize,
@@ -231,7 +268,7 @@ impl X86Instruction {
         }
     }
 
-    /// Compare source and destination
+    /// Compare immediate and destination
     pub fn cmp_immediate(
         size: OperandSize,
         destination: u8,
@@ -395,11 +432,38 @@ impl X86Instruction {
         }
     }
 
-    /// Pop into RIP
+    /// Push RIP and jump to destination
+    pub fn call_reg(
+        size: OperandSize,
+        destination: u8,
+        indirect: Option<X86IndirectAccess>,
+    ) -> Self {
+        Self {
+            size,
+            opcode: 0xff,
+            first_operand: 2,
+            second_operand: destination,
+            indirect,
+            ..Self::default()
+        }
+    }
+
+    /// Pop RIP
     pub fn return_near() -> Self {
         Self {
             size: OperandSize::S32,
             opcode: 0xc3,
+            modrm: false,
+            ..Self::default()
+        }
+    }
+
+    /// No operation
+    #[allow(dead_code)]
+    pub fn noop() -> Self {
+        Self {
+            size: OperandSize::S32,
+            opcode: 0x90,
             modrm: false,
             ..Self::default()
         }

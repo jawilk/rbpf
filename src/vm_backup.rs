@@ -10,26 +10,41 @@
 
 //! Virtual machine and JIT compiler for eBPF programs.
 
+use crate::disassembler::disassemble_instruction;
+#[cfg(feature = "debug")]
+use crate::gdb_stub::{start_debug_server, BpfRegs, BreakpointTable, VmReply, VmRequest};
+use crate::static_analysis::Analysis;
 use crate::{
     call_frames::CallFrames,
-    disassembler, ebpf,
+    ebpf,
     elf::EBpfElf,
     error::{EbpfError, UserDefinedError},
     jit::{JitProgram, JitProgramArgument},
     memory_region::{AccessType, MemoryMapping, MemoryRegion},
     user_error::UserError,
+    verifier::VerifierError,
 };
-use log::debug;
-use std::{collections::HashMap, fmt::Debug, u32};
-
-#[cfg(feature = "debug")]
-use crate::gdb_stub::{start_debug_server, BreakpointTable, VmReply, VmRequest};
 #[cfg(feature = "debug")]
 use gdbstub::target::ext::base::singlethread::{ResumeAction, SingleThreadOps, StopReason};
 #[cfg(feature = "debug")]
 use gdbstub::target::ext::section_offsets::Offsets;
+use log::debug;
 #[cfg(feature = "debug")]
 use std::sync::mpsc;
+use std::{
+    collections::{BTreeMap, HashMap},
+    fmt::Debug,
+    u32,
+};
+
+#[cfg(feature = "debug")]
+struct DebugConfig {
+    reply: mpsc::SyncSender<VmReply>,
+    req: mpsc::Receiver<VmRequest>,
+    breakpoints: BreakpointTable,
+    wait: bool,
+    step: bool,
+}
 
 /// eBPF verification function that returns an error if the program does not meet its requirements.
 ///
@@ -39,7 +54,7 @@ use std::sync::mpsc;
 ///   - Unknown instructions.
 ///   - Bad formed instruction.
 ///   - Unknown eBPF syscall index.
-pub type Verifier<E> = fn(prog: &[u8]) -> Result<(), E>;
+pub type Verifier = fn(prog: &[u8]) -> Result<(), VerifierError>;
 
 /// Return value of programs and syscalls
 pub type ProgramResult<E> = Result<u64, EbpfError<E>>;
@@ -185,6 +200,12 @@ pub struct Config {
     pub enable_instruction_meter: bool,
     /// Enable instruction tracing
     pub enable_instruction_tracing: bool,
+    /// Ratio of random no-ops per instruction in JIT (0.0 = OFF)
+    pub noop_instruction_ratio: f64,
+    /// Enable disinfection of immediate values and offsets provided by the user in JIT
+    pub sanitize_user_provided_values: bool,
+    /// Encrypt the environment registers in JIT
+    pub encrypt_environment_registers: bool,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -193,6 +214,9 @@ impl Default for Config {
             stack_frame_size: 4_096,
             enable_instruction_meter: true,
             enable_instruction_tracing: false,
+            noop_instruction_ratio: 1.0 / 256.0,
+            sanitize_user_provided_values: true,
+            encrypt_environment_registers: true,
         }
     }
 }
@@ -207,10 +231,8 @@ pub trait Executable<E: UserDefinedError, I: InstructionMeter>: Send + Sync {
     fn get_ro_sections(&self) -> Result<Vec<(u64, &[u8])>, EbpfError<E>>;
     /// Get the entry point offset into the text section
     fn get_entrypoint_instruction_offset(&self) -> Result<usize, EbpfError<E>>;
-    /// Set a symbol's instruction offset
-    fn register_bpf_function(&mut self, hash: u32, pc: usize);
     /// Get a symbol's instruction offset
-    fn lookup_bpf_function(&self, hash: u32) -> Option<&usize>;
+    fn lookup_bpf_function(&self, hash: u32) -> Option<usize>;
     /// Get the syscall registry
     fn get_syscall_registry(&self) -> &SyscallRegistry;
     /// Set (overwrite) the syscall registry
@@ -222,7 +244,7 @@ pub trait Executable<E: UserDefinedError, I: InstructionMeter>: Send + Sync {
     /// Report information on a symbol that failed to be resolved
     fn report_unresolved_symbol(&self, insn_offset: usize) -> Result<u64, EbpfError<E>>;
     /// Get syscalls and BPF functions (if debug symbols are not stripped)
-    fn get_symbols(&self) -> (HashMap<u32, String>, HashMap<usize, (String, usize)>);
+    fn get_symbols(&self) -> (BTreeMap<u32, String>, BTreeMap<usize, (u32, String)>);
 }
 
 /// Static constructors for Executable
@@ -230,7 +252,7 @@ impl<E: UserDefinedError, I: 'static + InstructionMeter> dyn Executable<E, I> {
     /// Creates a post relocaiton/fixup executable from an ELF file
     pub fn from_elf(
         elf_bytes: &[u8],
-        verifier: Option<Verifier<E>>,
+        verifier: Option<Verifier>,
         config: Config,
     ) -> Result<Box<Self>, EbpfError<E>> {
         let ebpf_elf = EBpfElf::load(config, elf_bytes)?;
@@ -243,13 +265,18 @@ impl<E: UserDefinedError, I: 'static + InstructionMeter> dyn Executable<E, I> {
     /// Creates a post relocaiton/fixup executable from machine code
     pub fn from_text_bytes(
         text_bytes: &[u8],
-        verifier: Option<Verifier<E>>,
+        bpf_functions: BTreeMap<u32, (usize, String)>,
+        verifier: Option<Verifier>,
         config: Config,
     ) -> Result<Box<Self>, EbpfError<E>> {
         if let Some(verifier) = verifier {
-            verifier(text_bytes)?;
+            verifier(text_bytes).map_err(EbpfError::VerifierError)?;
         }
-        Ok(Box::new(EBpfElf::new_from_text_bytes(config, text_bytes)))
+        Ok(Box::new(EBpfElf::new_from_text_bytes(
+            config,
+            text_bytes,
+            bpf_functions,
+        )))
     }
 }
 
@@ -271,6 +298,43 @@ impl InstructionMeter for DefaultInstructionMeter {
     }
 }
 
+/// Statistic of taken branches (from a recorded trace)
+pub struct DynamicAnalysis {
+    /// Maximal edge counter value
+    pub edge_counter_max: usize,
+    /// src_node, dst_node, edge_counter
+    pub edges: BTreeMap<usize, BTreeMap<usize, usize>>,
+}
+
+impl DynamicAnalysis {
+    /// Accumulates a trace
+    pub fn new<E: UserDefinedError, I: InstructionMeter>(
+        tracer: &Tracer,
+        analysis: &Analysis<E, I>,
+    ) -> Self {
+        let mut result = Self {
+            edge_counter_max: 0,
+            edges: BTreeMap::new(),
+        };
+        let mut last_basic_block = std::usize::MAX;
+        for traced_instruction in tracer.log.iter() {
+            let pc = traced_instruction[11] as usize;
+            if analysis.cfg_nodes.contains_key(&pc) {
+                let counter = result
+                    .edges
+                    .entry(last_basic_block)
+                    .or_insert_with(BTreeMap::new)
+                    .entry(pc)
+                    .or_insert(0);
+                *counter += 1;
+                result.edge_counter_max = result.edge_counter_max.max(*counter);
+                last_basic_block = pc;
+            }
+        }
+        result
+    }
+}
+
 /// Used for instruction tracing
 #[derive(Default, Clone)]
 pub struct Tracer {
@@ -285,33 +349,41 @@ impl Tracer {
     }
 
     /// Use this method to print the log of this tracer
-    pub fn write<W: std::fmt::Write>(
+    pub fn write<W: std::io::Write, E: UserDefinedError, I: InstructionMeter>(
         &self,
-        out: &mut W,
-        program: &[u8],
-    ) -> Result<(), std::fmt::Error> {
-        let disassembled = disassembler::to_insn_vec(program);
-        let mut pc_to_instruction_index =
-            vec![0usize; disassembled.last().map(|ins| ins.ptr + 2).unwrap_or(0)];
-        for index in 0..disassembled.len() {
-            pc_to_instruction_index[disassembled[index].ptr] = index;
-            pc_to_instruction_index[disassembled[index].ptr + 1] = index;
+        output: &mut W,
+        analysis: &Analysis<E, I>,
+    ) -> Result<(), std::io::Error> {
+        let mut pc_to_insn_index = vec![
+            0usize;
+            analysis
+                .instructions
+                .last()
+                .map(|insn| insn.ptr + 2)
+                .unwrap_or(0)
+        ];
+        for (index, insn) in analysis.instructions.iter().enumerate() {
+            pc_to_insn_index[insn.ptr] = index;
+            pc_to_insn_index[insn.ptr + 1] = index;
         }
         for index in 0..self.log.len() {
             let entry = &self.log[index];
+            let pc = entry[11] as usize;
+            let insn = &analysis.instructions[pc_to_insn_index[pc]];
             writeln!(
-                out,
+                output,
                 "{:5?} {:016X?} {:5?}: {}",
                 index,
                 &entry[0..11],
-                entry[11] as usize + ebpf::ELF_INSN_DUMP_OFFSET,
-                disassembled[pc_to_instruction_index[entry[11] as usize]].desc,
+                pc + ebpf::ELF_INSN_DUMP_OFFSET,
+                disassemble_instruction(&insn, &analysis),
             )?;
         }
         Ok(())
     }
 
     /// Compares an interpreter trace and a JIT trace.
+    ///
     /// The log of the JIT can be longer because it only validates the instruction meter at branches.
     pub fn compare(interpreter: &Self, jit: &Self) -> bool {
         let interpreter = interpreter.log.as_slice();
@@ -363,7 +435,7 @@ pub const SYSCALL_CONTEXT_OBJECTS_OFFSET: usize = 6;
 /// # Examples
 ///
 /// ```
-/// use solana_rbpf::{vm::{Config, Executable, EbpfVm, DefaultInstructionMeter}, user_error::UserError};
+/// use solana_rbpf::{ebpf, elf::register_bpf_function, vm::{Config, Executable, EbpfVm, DefaultInstructionMeter}, user_error::UserError};
 ///
 /// let prog = &[
 ///     0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00  // exit
@@ -373,7 +445,9 @@ pub const SYSCALL_CONTEXT_OBJECTS_OFFSET: usize = 6;
 /// ];
 ///
 /// // Instantiate a VM.
-/// let executable = Executable::<UserError, DefaultInstructionMeter>::from_text_bytes(prog, None, Config::default()).unwrap();
+/// let mut bpf_functions = std::collections::BTreeMap::new();
+/// register_bpf_function(&mut bpf_functions, 0, "entrypoint").unwrap();
+/// let mut executable = <dyn Executable::<UserError, DefaultInstructionMeter>>::from_text_bytes(prog, bpf_functions, None, Config::default()).unwrap();
 /// let mut vm = EbpfVm::<UserError, DefaultInstructionMeter>::new(executable.as_ref(), mem, &[]).unwrap();
 ///
 /// // Provide a reference to the packet data.
@@ -400,14 +474,16 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, E, I> {
     /// # Examples
     ///
     /// ```
-    /// use solana_rbpf::{vm::{Config, Executable, EbpfVm, DefaultInstructionMeter}, user_error::UserError};
+    /// use solana_rbpf::{ebpf, elf::register_bpf_function, vm::{Config, Executable, EbpfVm, DefaultInstructionMeter}, user_error::UserError};
     ///
     /// let prog = &[
     ///     0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00  // exit
     /// ];
     ///
     /// // Instantiate a VM.
-    /// let executable = Executable::<UserError, DefaultInstructionMeter>::from_text_bytes(prog, None, Config::default()).unwrap();
+    /// let mut bpf_functions = std::collections::BTreeMap::new();
+    /// register_bpf_function(&mut bpf_functions, 0, "entrypoint").unwrap();
+    /// let mut executable = <dyn Executable::<UserError, DefaultInstructionMeter>>::from_text_bytes(prog, bpf_functions, None, Config::default()).unwrap();
     /// let mut vm = EbpfVm::<UserError, DefaultInstructionMeter>::new(executable.as_ref(), &mut [], &[]).unwrap();
     /// ```
     pub fn new(
@@ -444,8 +520,6 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, E, I> {
             0,
             false,
         ));
-        //println!("Program: {:?}", program);
-        println!("program_vm_addr: {}", program_vm_addr);
         let number_of_syscalls = executable.get_syscall_registry().get_number_of_syscalls();
         let mut vm = EbpfVm {
             executable,
@@ -492,7 +566,7 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, E, I> {
     /// # Examples
     ///
     /// ```
-    /// use solana_rbpf::{vm::{Config, Executable, EbpfVm, SyscallObject, SyscallRegistry, DefaultInstructionMeter}, syscalls::BpfTracePrintf, user_error::UserError};
+    /// use solana_rbpf::{ebpf, elf::register_bpf_function, vm::{Config, Executable, EbpfVm, SyscallObject, SyscallRegistry, DefaultInstructionMeter}, syscalls::BpfTracePrintf, user_error::UserError};
     ///
     /// // This program was compiled with clang, from a C program containing the following single
     /// // instruction: `return bpf_trace_printk("foo %c %c %c\n", 10, 1, 2, 3);`
@@ -515,7 +589,9 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, E, I> {
     /// let mut syscall_registry = SyscallRegistry::default();
     /// syscall_registry.register_syscall_by_hash(6, BpfTracePrintf::call).unwrap();
     /// // Instantiate an Executable and VM
-    /// let mut executable = Executable::<UserError, DefaultInstructionMeter>::from_text_bytes(prog, None, Config::default()).unwrap();
+    /// let mut bpf_functions = std::collections::BTreeMap::new();
+    /// register_bpf_function(&mut bpf_functions, 0, "entrypoint").unwrap();
+    /// let mut executable = <dyn Executable::<UserError, DefaultInstructionMeter>>::from_text_bytes(prog, bpf_functions, None, Config::default()).unwrap();
     /// executable.set_syscall_registry(syscall_registry);
     /// let mut vm = EbpfVm::<UserError, DefaultInstructionMeter>::new(executable.as_ref(), &mut [], &[]).unwrap();
     /// // Bind a context object instance to the previously registered syscall
@@ -568,7 +644,7 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, E, I> {
     /// # Examples
     ///
     /// ```
-    /// use solana_rbpf::{vm::{Config, Executable, EbpfVm, DefaultInstructionMeter}, user_error::UserError};
+    /// use solana_rbpf::{ebpf, elf::register_bpf_function, vm::{Config, Executable, EbpfVm, DefaultInstructionMeter}, user_error::UserError};
     ///
     /// let prog = &[
     ///     0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00  // exit
@@ -578,7 +654,9 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, E, I> {
     /// ];
     ///
     /// // Instantiate a VM.
-    /// let executable = Executable::<UserError, DefaultInstructionMeter>::from_text_bytes(prog, None, Config::default()).unwrap();
+    /// let mut bpf_functions = std::collections::BTreeMap::new();
+    /// register_bpf_function(&mut bpf_functions, 0, "entrypoint").unwrap();
+    /// let mut executable = <dyn Executable::<UserError, DefaultInstructionMeter>>::from_text_bytes(prog, bpf_functions, None, Config::default()).unwrap();
     /// let mut vm = EbpfVm::<UserError, DefaultInstructionMeter>::new(executable.as_ref(), mem, &[]).unwrap();
     ///
     /// // Provide a reference to the packet data.
@@ -604,26 +682,57 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, E, I> {
     fn handle_dbg_request(
         &mut self,
         request: VmRequest,
-        reply: &mut mpsc::SyncSender<VmReply>,
-        req: &mut mpsc::Receiver<VmRequest>,
-        breakpoints: &mut BreakpointTable,
-        step: &mut bool,
+        debug_config: DebugConfig,
+        reg: &[u64; 11],
+        host_ptr: *mut u8, // Host ptr
+        pc: usize,
     ) {
         match request {
-            VmRequest::Resume => {}
-            VmRequest::Interrupt => {
-                reply.send(VmReply::Interrupt).unwrap();
-                self.check_for_dbg_request(true, reply, req, breakpoints, step);
+            VmRequest::Resume => {
+                println!("Continuing...");
+                debug_config.step = false;
             }
             VmRequest::Step => {
-                *step = true;
+                println!("Requested STEP");
+                debug_config.reply.send(VmReply::DoneStep);
+                debug_config.wait = true;
+                debug_config.step = false;
+            }
+            VmRequest::ReadMem(start_addr, len) => {
+                let adj_ptr = unsafe { host_ptr.offset(start_addr as isize) };
+                println!(
+                    "Request for MEM: {} {} {}",
+                    adj_ptr as usize, start_addr, len
+                );
+                let read_mem = unsafe { std::slice::from_raw_parts(adj_ptr, len as usize) };
+                println!("Read mem: {:?}", read_mem);
+                debug_config.reply.send(VmReply::ReadMem(read_mem));
+            }
+            VmRequest::ReadRegs => {
+                println!("Get Regs");
+                let mut regs_only: [u64; 10] = Default::default();
+                regs_only.copy_from_slice(&reg[..10]);
+                debug_config
+                    .reply
+                    .send(VmReply::ReadRegs(BpfRegs {
+                        r: regs_only,
+                        sp: reg[10] as u32, //- 8589938688;
+                        pc: (pc * 8) as u32,
+                    }))
+                    .unwrap();
+            }
+            VmRequest::Interrupt => {
+                debug_config.reply.send(VmReply::Interrupt).unwrap();
+                self.check_for_dbg_request(debug_config, &reg, host_ptr, pc);
             }
             VmRequest::SetBrkpt(addr) => {
-                breakpoints.set_breakpoint(addr);
-                reply.send(VmReply::SetBrkpt).unwrap();
+                println!("VM SET BREAK REQUEST {}", addr);
+                debug_config.breakpoints.set_breakpoint(addr);
+                debug_config.reply.send(VmReply::SetBrkpt).unwrap();
             }
             VmRequest::RemoveBrkpt(addr) => {
-                breakpoints.remove_breakpoint(addr);
+                debug_config.breakpoints.remove_breakpoint(addr);
+                debug_config.reply.send(VmReply::RemoveBrkpt).unwrap();
             }
             VmRequest::Offsets => {
                 let res = match self.executable.get_text_bytes() {
@@ -636,11 +745,24 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, E, I> {
                     }
                     Err(_) => VmReply::Err("could not fetch offsets"),
                 };
-                reply.send(res).unwrap();
+                debug_config.reply.send(res).unwrap();
             }
             _ => {
-                reply.send(VmReply::Err("unimplemented")).unwrap();
+                debug_config
+                    .reply
+                    .send(VmReply::Err("unimplemented"))
+                    .unwrap();
             }
+        }
+    }
+
+    #[cfg(feature = "debug")]
+    fn receive_dgb_request(req: mpsc::Receiver<VmRequest>) -> VmRequest {
+        if let Ok(request) = req.recv() {
+            return request;
+        } else {
+            eprintln!("debugger detatched from VM");
+            std::process::exit(1);
         }
     }
 
@@ -648,29 +770,29 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, E, I> {
     #[cfg(feature = "debug")]
     fn check_for_dbg_request(
         &mut self,
-        block: bool,
-        reply: &mut mpsc::SyncSender<VmReply>,
-        req: &mut mpsc::Receiver<VmRequest>,
-        breakpoints: &mut BreakpointTable,
-        step: &mut bool,
+        debug_config: DebugConfig,
+        reg: &[u64; 11],
+        host_ptr: *mut u8,
+        pc: usize,
     ) {
-        if block {
-            println!("Receiver");
-            if let Ok(request) = req.recv() {
-                self.handle_dbg_request(request, reply, req, breakpoints, step);
-            } else {
-                eprintln!("debugger detatched from VM");
-                std::process::exit(1);
-            }
-        } else {
-            match req.try_recv() {
-                Ok(request) => self.handle_dbg_request(request, reply, req, breakpoints, step),
-                Err(mpsc::TryRecvError::Empty) => {}
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    eprintln!("debugger detatched from VM");
-                    std::process::exit(1);
-                }
-            }
+        println!("step {}", debug_config.wait);
+        if (debug_config.step) {
+            debug_config.wait = true;
+            debug_config.step = false;
+        }
+        println!("Within debug cycle");
+        let (ref mut reply, ref mut req) = dbg_interface;
+        while debug_config.wait {
+            println!("Vm addr: {}", vm_addr);
+            let host_ptr = translate_memory_access!(self, vm_addr, AccessType::Load, pc, u8);
+            let request = self.receive_dgb_request(debug_config.req);
+            self.handle_dbg_request(request, debug_config, &reg, host_ptr, pc);
+        }
+        if breakpoints.check_breakpoint(pc as u64) {
+            println!("Program loop breakpoint");
+            reply.send(VmReply::Breakpoint).unwrap();
+            let request = self.receive_dgb_request(debug_config.req);
+            self.handle_dbg_request(request, debug_config, &reg, host_ptr, pc);
         }
     }
 
@@ -694,38 +816,53 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, E, I> {
 
         // Loop on instructions
         let entry = self.executable.get_entrypoint_instruction_offset()?;
+        println!("Entry: {}", entry);
         let mut next_pc: usize = entry;
-
-        println!("CONNECTing 1");
-        #[cfg(feature = "debug")]
-        let mut dbg_interface = (start_debug_server(9001, &reg, next_pc as u64), BreakpointTable::new());
-        println!("CONNECTING 2");
-
-        #[cfg(feature = "debug")]
-        let mut step = true;
-
         let mut remaining_insn_count = if instruction_meter_enabled { instruction_meter.get_remaining() } else { 0 };
         let initial_insn_count = remaining_insn_count;
         self.last_insn_count = 0;
         let mut total_insn_count = 0;
+        // ---------- DEBUGGER -------------
+        #[cfg(feature = "debug")]
+        println!("CONNECTING");
+        #[cfg(feature = "debug")]
+        let (reply, req) = (start_debug_server(9001, &reg, next_pc as u64));
+        println!("Regs: {:?}", reg);
+        println!("Memory 1: {:?}", self.program);
+        println!("Memory address prog: {}", self.program_vm_addr);
+        let vm_addr = self.program_vm_addr.wrapping_add((entry*8) as u64);//ebpf::MM_PROGRAM_START;
+        println!("start: {}", vm_addr);
+        let host_ptr = translate_memory_access!(self, vm_addr, AccessType::Load, next_pc, u8);
+        println!("Host ptr: {:?}", host_ptr);
+        let first = unsafe { std::slice::from_raw_parts(host_ptr, 2) };
+        println!("FIRST: {:?}", first);
+
+        #[cfg(feature = "debug")]
+        let mut debug_config = DebugConfig { reply, req, breakpoints: BreakpointTable, wait: true, step: false };
+        // ---------- DEBUGGER -------------
         while next_pc * ebpf::INSN_SIZE + ebpf::INSN_SIZE <= self.program.len() {
-            println!("INSIDE LOOP");
             let pc = next_pc;
             // TODO make this not use unwrap()
             #[cfg(feature = "debug")]
+            self.check_for_dbg_request(reply, req, &mut debug_config.breakpoints, &reg, host_ptr, pc, &mut step, &mut do_step);
+            #[cfg(feature = "debug")]
             {
+                println!("step {}", step);
+                if (debug_config.step) { debug_config.wait = true; debug_config.step = false; }
                 println!("Within debug cycle");
-                let ((ref mut reply, ref mut req), ref mut breakpoints) = dbg_interface;
-                if step {
-                    step = true;
-                    self.check_for_dbg_request(true, reply, req, breakpoints, &mut step);
-                } else if breakpoints.check_breakpoint(pc as u64) {
+                let (ref mut reply, ref mut req) = dbg_interface;
+                while debug_config.wait {
+                    println!("Vm addr: {}", vm_addr);
+                    let host_ptr = translate_memory_access!(self, vm_addr, AccessType::Load, pc, u8);
+                    self.check_for_dbg_request(reply, req, &mut debug_config.breakpoints, &reg, host_ptr, pc, &mut step, &mut do_step);
+                } 
+                if breakpoints.check_breakpoint(pc as u64) {
+                    println!("Program loop breakpoint");
                     reply.send(VmReply::Breakpoint).unwrap();
-                    self.check_for_dbg_request(true, reply, req, breakpoints, &mut step);
-                } else {
-                    self.check_for_dbg_request(false, reply, req, breakpoints, &mut step);
+                    self.check_for_dbg_request(reply, req, breakpoints, &reg, host_ptr, pc, &mut step, &mut do_step);
                 }
             }
+
             next_pc += 1;
             let mut insn = ebpf::get_insn_unchecked(self.program, pc);
             println!("Insn: {:?}", insn);
@@ -734,16 +871,13 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, E, I> {
             let dst = insn.dst as usize;
             let src = insn.src as usize;
             self.last_insn_count += 1;
-         
+
             if instruction_tracing_enabled {
                 let mut state = [0u64; 12];
                 state[0..11].copy_from_slice(&reg);
                 state[11] = pc as u64;
                 self.tracer.trace(state);
             }
-                    let vm_addr = (reg[10] as i64).wrapping_add(-20 as i64) as u64;
-                    let host_ptr = translate_memory_access!(self, vm_addr, AccessType::Store, pc, u32);
-                    unsafe { println!("host_ptr: {}****************", *host_ptr) };
 
             match insn.opc {
 
@@ -853,13 +987,9 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, E, I> {
                     unsafe { *host_ptr = reg[src] as u16 };
                 },
                 ebpf::ST_W_REG   => {
-                    println!("ST_W_REG");
                     let vm_addr = (reg[dst] as i64).wrapping_add(insn.off as i64) as u64;
-                    println!("vm_addr: {}", vm_addr);
                     let host_ptr = translate_memory_access!(self, vm_addr, AccessType::Store, pc, u32);
-                    unsafe { println!("host_ptr: {}", *host_ptr) };
                     unsafe { *host_ptr = reg[src] as u32 };
-                    unsafe { println!("host_ptr: {}", *host_ptr) };
                 },
                 ebpf::ST_DW_REG  => {
                     let vm_addr = (reg[dst] as i64).wrapping_add(insn.off as i64) as u64;
@@ -962,7 +1092,7 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, E, I> {
                 ebpf::ARSH64_REG => reg[dst] = (reg[dst] as i64).wrapping_shr(reg[src] as u32) as u64,
 
                 // BPF_JMP class
-                ebpf::JA         =>                                            next_pc = (next_pc as isize + insn.off as isize) as usize,
+                ebpf::JA         =>                                          { next_pc = (next_pc as isize + insn.off as isize) as usize; },
                 ebpf::JEQ_IMM    => if  reg[dst] == insn.imm as u64          { next_pc = (next_pc as isize + insn.off as isize) as usize; },
                 ebpf::JEQ_REG    => if  reg[dst] == reg[src]                 { next_pc = (next_pc as isize + insn.off as isize) as usize; },
                 ebpf::JGT_IMM    => if  reg[dst] >  insn.imm as u64          { next_pc = (next_pc as isize + insn.off as isize) as usize; },
@@ -1027,7 +1157,7 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, E, I> {
                                 ..ebpf::FIRST_SCRATCH_REG + ebpf::SCRATCH_REGS],
                             next_pc,
                         )?;
-                        next_pc = self.check_pc(pc, *target_pc)?;
+                        next_pc = self.check_pc(pc, target_pc)?;
                     } else {
                         self.executable.report_unresolved_symbol(pc)?;
                     }
@@ -1058,13 +1188,6 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, E, I> {
             if instruction_meter_enabled && self.last_insn_count >= remaining_insn_count {
                 return Err(EbpfError::ExceededMaxInstructions(pc + 1 + ebpf::ELF_INSN_DUMP_OFFSET, initial_insn_count));
             }
-        }
-
-        // TODO make this not use unwrap
-        #[cfg(feature = "debug")]
-        {
-            let ((ref mut reply, _), _) = dbg_interface;
-            reply.send(VmReply::Halted).unwrap();
         }
 
         Err(EbpfError::ExecutionOverrun(
