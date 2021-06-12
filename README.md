@@ -27,6 +27,7 @@ notext -shared --Bdynamic -entry entrypoint -o test_simple_add_vm.so test_simple
     - (gdb) set disassemble-next-line on
     - (gdb) target remote :9001
 6. Debugging
+     - Please only use stepi/step, c (continue) is not supported yet
      - (gdb) stepi/step - for instruction or line stepping
      - (gdb) i r - print registers + sp + pc
      - (gdb) i locals - print all variables in current scope (if not optimized out)
