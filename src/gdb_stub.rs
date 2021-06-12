@@ -5,9 +5,9 @@ use gdbstub::{
         ext::{
             base::{
                 singlethread::{ResumeAction, SingleThreadOps, StopReason},
-                BaseOps,
+                BaseOps, GdbInterrupt, SingleRegisterAccess, SingleRegisterAccessOps,
             },
-            breakpoints::{SwBreakpoint, SwBreakpointOps},
+            breakpoints::{Breakpoints, BreakpointsOps, SwBreakpoint, SwBreakpointOps},
             section_offsets::{Offsets, SectionOffsets, SectionOffsetsOps},
         },
         Target, TargetError, TargetResult,
@@ -22,12 +22,14 @@ use std::sync::mpsc;
 
 const BRPKT_MAP_THRESH: usize = 30;
 
+/*
+TODO
 const NUM_REGS: usize = 11;
 const NUM_REGS_WITH_PC: usize = 12;
 const REG_SIZE: usize = 8;
 const REG_NUM_BYTES: usize = NUM_REGS * REG_SIZE;
 const REG_WITH_PC_NUM_BYTES: usize = NUM_REGS * REG_SIZE;
-
+*/
 // TODO make this not use unwrap
 // TODO add support for Unix Domain Sockets
 pub fn start_debug_server(
@@ -35,8 +37,9 @@ pub fn start_debug_server(
     init_regs: &[u64; 11],
     init_pc: u64,
 ) -> (mpsc::SyncSender<VmReply>, mpsc::Receiver<VmRequest>) {
+    println!("STARTING regs: {:?} --- pc: {}", init_regs, init_pc);
     let conn = wait_for_gdb_connection(port).unwrap();
-    let (mut target, tx, rx) = DebugServer::new(init_regs, init_pc);
+    let (mut target, tx, rx) = DebugServer::new(init_regs, init_pc as u32);
 
     std::thread::spawn(move || {
         let mut debugger = GdbStub::new(conn);
@@ -45,8 +48,13 @@ pub fn start_debug_server(
         match debugger.run(&mut target) {
             Ok(disconnect_reason) => match disconnect_reason {
                 DisconnectReason::Disconnect => println!("GDB client disconnected."),
-                DisconnectReason::TargetHalted => println!("Target halted!"),
                 DisconnectReason::Kill => println!("GDB client sent a kill command!"),
+                DisconnectReason::TargetExited(code) => {
+                    println!("Target exited with code {}!", code)
+                }
+                DisconnectReason::TargetTerminated(sig) => {
+                    println!("Target terminated with signal {}!", sig)
+                }
             },
             // Handle any target-specific errors
             Err(GdbStubError::TargetError(e)) => {
@@ -60,7 +68,6 @@ pub fn start_debug_server(
             }
         }
     });
-    std::thread::sleep(std::time::Duration::from_millis(10000));
     (tx, rx)
 }
 
@@ -143,24 +150,26 @@ impl BreakpointTable {
 pub struct DebugServer {
     req: mpsc::SyncSender<VmRequest>,
     reply: mpsc::Receiver<VmReply>,
-    regs: BPFRegs,
 }
 
 impl DebugServer {
     fn new(
         regs: &[u64; 11],
-        pc: u64,
+        _pc: u32,
     ) -> (Self, mpsc::SyncSender<VmReply>, mpsc::Receiver<VmRequest>) {
         let (req_tx, req_rx) = mpsc::sync_channel::<VmRequest>(0);
         let (reply_tx, reply_rx) = mpsc::sync_channel::<VmReply>(0);
+        let mut regs_only: [u64; 10] = Default::default();
+        regs_only.copy_from_slice(&regs[..10]);
         (
             DebugServer {
                 req: req_tx,
                 reply: reply_rx,
-                regs: BPFRegs {
-                    regs: *regs,
-                    pc: pc,
-                },
+                /*regs: BpfRegs {
+                    r: regs_only,
+                    sp: regs[10] as u32,
+                    pc,
+                },*/
             },
             reply_tx,
             req_rx,
@@ -168,26 +177,64 @@ impl DebugServer {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 #[repr(C)]
-pub struct BPFRegs {
-    regs: [u64; 11],
-    pc: u64,
+pub struct BpfRegs {
+    pub r: [u64; 10],
+    pub sp: u32,
+    pub pc: u32,
 }
 
 // TODO use something safer than transmute_copy
-impl Registers for BPFRegs {
-    fn gdb_serialize(&self, mut write_byte: impl FnMut(Option<u8>)) {
-        let bytes: [u8; REG_WITH_PC_NUM_BYTES] = unsafe { std::mem::transmute_copy(self) };
-        bytes.iter().for_each(|b| write_byte(Some(*b)));
+impl Registers for BpfRegs {
+    type ProgramCounter = u64; // Wrong (u32)
+
+    fn pc(&self) -> Self::ProgramCounter {
+        println!("ASKING FOR PC");
+        self.pc as u64
     }
 
-    fn gdb_deserialize(&mut self, bytes: &[u8]) -> Result<(), ()> {
+    fn gdb_serialize(&self, mut write_byte: impl FnMut(Option<u8>)) {
+        macro_rules! write_bytes {
+            ($bytes:expr) => {
+                for b in $bytes {
+                    write_byte(Some(*b))
+                }
+            };
+        }
+
+        //let mut bytes: [u8; REG_WITH_PC_NUM_BYTES] = unsafe { std::mem::transmute_copy(self) };
+        for reg in self.r.iter() {
+            write_bytes!(&reg.to_le_bytes());
+        }
+        write_bytes!(&self.sp.to_le_bytes());
+        write_bytes!(&self.pc.to_le_bytes());
+        //bytes
+        //  .iter()
+        //        .for_each(|b| write_byte(Some(*(&b.to_le_bytes()))));
+    }
+
+    fn gdb_deserialize(&mut self, _bytes: &[u8]) -> Result<(), ()> {
+        Ok(())
+        // TODO
+        /*
+        use core::convert::TryInto;
+        let mut regs = bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()));
+
+        for reg in self.r.iter_mut() {
+            *reg = regs.next().ok_or(())?
+        }
+        self.sp = regs.next().ok_or(())?;
+        self.lr = regs.next().ok_or(())?;
+        self.pc = regs.next().ok_or(())?;
+
         let mut rdr = Cursor::new(bytes);
-        let mut acc = BPFRegs::default();
+        let mut acc = BpfRegs::default();
         for i in 0..NUM_REGS {
-            if let Ok(u) = rdr.read_u64::<LittleEndian>() {
-                acc.regs[i] = u;
+            if let Ok(u) = rdr.read_u32::<LittleEndian>() {
+                acc.r[i] = u;
             } else {
                 return Err(());
             }
@@ -198,90 +245,120 @@ impl Registers for BPFRegs {
             Ok(())
         } else {
             Err(())
-        }
+        }*/
     }
 }
 
 #[derive(Debug)]
-pub struct BPFRegId(u8);
-impl RegId for BPFRegId {
+pub struct BpfRegId(u8);
+impl RegId for BpfRegId {
     fn from_raw_id(id: usize) -> Option<(Self, usize)> {
+        println!("FROM RAW IDDDDDDDD");
         if id < 13 {
-            Some((BPFRegId(id as u8), 64))
+            Some((BpfRegId(id as u8), 64))
         } else {
             None
         }
     }
 }
 
-impl From<u8> for BPFRegId {
-    fn from(val: u8) -> BPFRegId {
-        BPFRegId(val)
+impl From<u8> for BpfRegId {
+    fn from(val: u8) -> BpfRegId {
+        //println!("FROM RAW ID");
+        BpfRegId(val)
     }
 }
 
-impl From<BPFRegId> for u8 {
-    fn from(val: BPFRegId) -> u8 {
+impl From<BpfRegId> for u8 {
+    fn from(val: BpfRegId) -> u8 {
+        //println!("FROM RAW ID");
         val.0
     }
 }
 
-pub struct BPFArch;
+#[derive(Debug)]
+pub enum BpfBreakpointKind {
+    Thumb16,
+}
 
-impl Arch for BPFArch {
+impl gdbstub::arch::BreakpointKind for BpfBreakpointKind {
+    fn from_usize(kind: usize) -> Option<Self> {
+        //println!("Brkp kind {}", kind);
+        let kind = match kind {
+            0 => BpfBreakpointKind::Thumb16,
+            _ => return None,
+        };
+        Some(kind)
+    }
+}
+
+pub enum Bpf {}
+
+impl Arch for Bpf {
     type Usize = u64;
-    type Registers = BPFRegs;
-    type RegId = BPFRegId;
+    type Registers = BpfRegs;
+    type RegId = BpfRegId;
+    type BreakpointKind = BpfBreakpointKind;
+
+    fn target_description_xml() -> Option<&'static str> {
+        Some(r#"<target version="1.0"><architecture>bpf</architecture></target>"#)
+    }
 }
 
 impl Target for DebugServer {
-    type Arch = BPFArch;
+    type Arch = Bpf;
     type Error = &'static str;
 
+    #[inline(always)]
     fn base_ops(&mut self) -> BaseOps<Self::Arch, Self::Error> {
         BaseOps::SingleThread(self)
     }
 
-    fn sw_breakpoint(&mut self) -> Option<SwBreakpointOps<Self>> {
+    #[inline(always)]
+    fn breakpoints(&mut self) -> Option<BreakpointsOps<Self>> {
+        //println!("TARGET BREAKPOINT");
         Some(self)
     }
 
+    #[inline(always)]
     fn section_offsets(&mut self) -> Option<SectionOffsetsOps<Self>> {
         Some(self)
     }
 }
 
+#[allow(dead_code)]
 pub enum VmRequest {
-    Resume,
-    Interrupt,
+    //Resume,
+    //Interrupt,
     Step,
     ReadReg(u8),
     ReadRegs,
     WriteReg(u8, u64),
-    WriteRegs([u64; 12]),
+    WriteRegs(BpfRegs),
     ReadMem(u64, u64),
     WriteMem(u64, u64, Vec<u8>),
     SetBrkpt(u64),
     RemoveBrkpt(u64),
-    Offsets,
-    Detatch,
+    //Offsets,
+    //Detatch,
 }
 
+#[allow(dead_code)]
 pub enum VmReply {
     DoneStep,
     Interrupt,
-    Halted,
+    Halted(u8),
     Breakpoint,
     Err(&'static str),
-    ReadRegs([u64; 12]),
+    ReadRegs(BpfRegs),
     ReadReg(u64),
     WriteRegs,
     WriteReg,
-    ReadMem(Vec<u8>),
+    ReadMem(&'static [u8]),
     WriteMem,
     SetBrkpt,
     RemoveBrkpt,
-    Offsets(Offsets<u64>),
+    //Offsets(Offsets<u64>),
 }
 
 // TODO make this not use unwrap
@@ -289,64 +366,84 @@ impl SingleThreadOps for DebugServer {
     fn resume(
         &mut self,
         action: ResumeAction,
-        check_gdb_interrupt: &mut dyn FnMut() -> bool,
+        _check_gdb_interrupt: GdbInterrupt<'_>,
     ) -> Result<StopReason<u64>, Self::Error> {
-        println!("RESUME");
         match action {
             ResumeAction::Step => {
                 self.req.send(VmRequest::Step).unwrap();
                 match self.reply.recv().unwrap() {
-                    VmReply::DoneStep => Ok(StopReason::DoneStep),
-                    _ => Err("unexpected  from VM"),
+                    VmReply::DoneStep => return Ok(StopReason::DoneStep),
+                    VmReply::Halted(ret_val) => {
+                        println!("Target HALTED");
+                        return Ok(StopReason::Exited(ret_val));
+                    }
+                    _ => return Err("unexpected  from VM"),
                 }
             }
             ResumeAction::Continue => {
-                println!("CONTINUE");
-                self.req.send(VmRequest::Resume).unwrap();
+                loop {
+                    match self.reply.try_recv().unwrap() {
+                        VmReply::Halted(ret_val) => {
+                            println!("Target HALTED");
+                            return Ok(StopReason::Exited(ret_val));
+                        }
+                        _ => continue,
+                    };
+                }
+                // TODO HERE
+                /*         self.req.send(VmRequest::Resume).unwrap();
                 // TODO find a better way to deal with check_gdb_interrupt
-                /*while !check_gdb_interrupt() {
+                while !check_gdb_interrupt() {
                     if let Ok(event) = self.reply.try_recv() {
                         return match event {
                             VmReply::Breakpoint => Ok(StopReason::SwBreak),
-                            VmReply::Halted => Ok(StopReason::Halted),
                             VmReply::Err(e) => Err(e),
                             _ => Err("unexpected reply from VM"),
                         };
                     }
-                }*/
-                //self.req.send(VmRequest::Interrupt).unwrap();
-                println!("CONTINUE END");
-                /*match self.reply.recv().unwrap() {
+                }
+                self.req.send(VmRequest::Interrupt).unwrap();
+                match self.reply.recv().unwrap() {
                     VmReply::Interrupt => Ok(StopReason::GdbInterrupt),
                     VmReply::Err(e) => Err(e),
                     _ => Err("unexpected reply from VM"),
-                }*/
-                Ok(StopReason::GdbInterrupt)
+                };*/
+                //Ok(StopReason::GdbInterrupt)
             }
-        }
+            _ => return Err("cannot resume with signal"),
+        };
+    }
+    fn single_register_access(&mut self) -> Option<SingleRegisterAccessOps<(), Self>> {
+        //println!("Single register access");
+        Some(self)
     }
 
-    fn read_registers(&mut self, regs: &mut BPFRegs) -> TargetResult<(), Self> {
-        println!("READ REGISTERSSS");
-        for i in 0..11 {
-            regs.regs[i] = self.regs.regs[i];
-        }
-        regs.pc = self.regs.pc;
-        /*self.req.send(VmRequest::ReadRegs).unwrap();
+    fn read_registers(&mut self, regs: &mut BpfRegs) -> TargetResult<(), Self> {
+        self.req.send(VmRequest::ReadRegs).unwrap();
         match self.reply.recv().unwrap() {
-            VmReply::ReadRegs(regfile) => {
-                *regs = unsafe { std::mem::transmute_copy(&regfile) };
+            VmReply::ReadRegs(BpfRegs { r, sp, pc }) => {
+                println!(
+                    "Sending back to gdb {:?} sp {:x?} pc {:x?} (hex)",
+                    r, sp, pc
+                );
+                regs.r = r;
+                regs.sp = sp;
+                regs.pc = pc;
                 Ok(())
             }
             VmReply::Err(e) => Err(TargetError::Fatal(e)),
             _ => Err(TargetError::Fatal("unexpected reply from VM")),
-        }*/
-        Ok(())
+        }
+        /*for i in 0..11 {
+            regs.regs[i] = self.regs.regs[i];
+        }
+        regs.pc = self.regs.pc;*/
+        //Ok(())
     }
 
-    fn write_registers(&mut self, regs: &BPFRegs) -> TargetResult<(), Self> {
-        let regfile: [u64; 12] = unsafe { std::mem::transmute_copy(regs) };
-        self.req.send(VmRequest::WriteRegs(regfile)).unwrap();
+    // TODO
+    fn write_registers(&mut self, regs: &BpfRegs) -> TargetResult<(), Self> {
+        self.req.send(VmRequest::WriteRegs(*regs)).unwrap();
         match self.reply.recv().unwrap() {
             VmReply::WriteRegs => Ok(()),
             VmReply::Err(e) => Err(TargetError::Fatal(e)),
@@ -354,36 +451,8 @@ impl SingleThreadOps for DebugServer {
         }
     }
 
-    fn read_register(&mut self, reg_id: BPFRegId, dst: &mut [u8]) -> TargetResult<(), Self> {
-        self.req.send(VmRequest::ReadReg(reg_id.into())).unwrap();
-        match self.reply.recv().unwrap() {
-            VmReply::ReadReg(val) => {
-                dst.copy_from_slice(&val.to_le_bytes());
-                Ok(())
-            }
-            VmReply::Err(e) => Err(TargetError::Fatal(e)),
-            _ => Err(TargetError::Fatal("unexpected reply from VM")),
-        }
-    }
-
-    fn write_register(&mut self, reg_id: BPFRegId, val: &[u8]) -> TargetResult<(), Self> {
-        let mut rdr = Cursor::new(val);
-        match rdr.read_u64::<LittleEndian>() {
-            Ok(reg) => {
-                self.req
-                    .send(VmRequest::WriteReg(reg_id.into(), reg))
-                    .unwrap();
-                match self.reply.recv().unwrap() {
-                    VmReply::WriteReg => Ok(()),
-                    VmReply::Err(e) => Err(TargetError::Fatal(e)),
-                    _ => Err(TargetError::Fatal("unexpected reply from VM")),
-                }
-            }
-            _ => Err(TargetError::Fatal("invalid number of bytes")),
-        }
-    }
-
     fn read_addrs(&mut self, start_addr: u64, dst: &mut [u8]) -> TargetResult<(), Self> {
+        //println!("READ MEM: {} {:?}", start_addr, dst);
         self.req
             .send(VmRequest::ReadMem(start_addr, dst.len() as u64))
             .unwrap();
@@ -400,7 +469,7 @@ impl SingleThreadOps for DebugServer {
             _ => Err(TargetError::Fatal("unexpected reply from VM")),
         }
     }
-
+    //TODO
     fn write_addrs(&mut self, start_addr: u64, data: &[u8]) -> TargetResult<(), Self> {
         self.req
             .send(VmRequest::WriteMem(
@@ -417,9 +486,60 @@ impl SingleThreadOps for DebugServer {
     }
 }
 
+impl SingleRegisterAccess<()> for DebugServer {
+    // TODO
+    fn read_register(
+        &mut self,
+        _tid: (),
+        reg_id: BpfRegId,
+        dst: &mut [u8],
+    ) -> TargetResult<(), Self> {
+        println!("READ SIIIINGLE REGISTER");
+        self.req.send(VmRequest::ReadReg(reg_id.into())).unwrap();
+        match self.reply.recv().unwrap() {
+            VmReply::ReadReg(val) => {
+                dst.copy_from_slice(&val.to_le_bytes());
+                Ok(())
+            }
+            VmReply::Err(e) => Err(TargetError::Fatal(e)),
+            _ => Err(TargetError::Fatal("unexpected reply from VM")),
+        }
+    }
+
+    fn write_register(&mut self, _tid: (), reg_id: BpfRegId, val: &[u8]) -> TargetResult<(), Self> {
+        println!("WRITE SINGLE REGISTER");
+        let mut rdr = Cursor::new(val);
+        match rdr.read_u64::<LittleEndian>() {
+            Ok(reg) => {
+                self.req
+                    .send(VmRequest::WriteReg(reg_id.into(), reg))
+                    .unwrap();
+                match self.reply.recv().unwrap() {
+                    VmReply::WriteReg => Ok(()),
+                    VmReply::Err(e) => Err(TargetError::Fatal(e)),
+                    _ => Err(TargetError::Fatal("unexpected reply from VM")),
+                }
+            }
+            _ => Err(TargetError::Fatal("invalid number of bytes")),
+        }
+    }
+}
+
+impl Breakpoints for DebugServer {
+    fn sw_breakpoint(&mut self) -> Option<SwBreakpointOps<Self>> {
+        //println!("SW Breakpoint");
+        Some(self)
+    }
+}
+
 // TODO make this not use unwrap
 impl SwBreakpoint for DebugServer {
-    fn add_sw_breakpoint(&mut self, addr: u64) -> TargetResult<bool, Self> {
+    fn add_sw_breakpoint(
+        &mut self,
+        addr: u64,
+        _kind: BpfBreakpointKind,
+    ) -> TargetResult<bool, Self> {
+        //println!("SERVER BREAKPOINT {}", addr);
         self.req.send(VmRequest::SetBrkpt(addr)).unwrap();
         match self.reply.recv().unwrap() {
             VmReply::SetBrkpt => Ok(true),
@@ -428,7 +548,12 @@ impl SwBreakpoint for DebugServer {
         }
     }
 
-    fn remove_sw_breakpoint(&mut self, addr: u64) -> TargetResult<bool, Self> {
+    fn remove_sw_breakpoint(
+        &mut self,
+        addr: u64,
+        _kind: BpfBreakpointKind,
+    ) -> TargetResult<bool, Self> {
+        //println!("REM SERVER BREAKPOINT");
         self.req.send(VmRequest::RemoveBrkpt(addr)).unwrap();
         match self.reply.recv().unwrap() {
             VmReply::RemoveBrkpt => Ok(true),
@@ -441,7 +566,7 @@ impl SwBreakpoint for DebugServer {
 // TODO make this not use unwrap
 impl SectionOffsets for DebugServer {
     fn get_section_offsets(&mut self) -> Result<Offsets<u64>, Self::Error> {
-        println!("OFFSETS");
+        println!("offsets REQUEST");
         Ok(Offsets::Sections {
             text: 0,
             data: 0,
