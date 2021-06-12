@@ -63,7 +63,7 @@ To inspect an object file to see all instructions: bpf-objdump -d <file_name> or
 2. If you want to use input you need to include <linux/bpf.h> and use struct __sk_buff *skb to save the input and skb->data to access it. See tests/elfs/test_simple_input.c. The offset of data within the struct can be modified (https://sourceware.org/gdb/current/onlinedocs/gdb/BPF.html)
 - You need to set the input before running the program but after loading it. The address can be found using objdump -d (eg 0x4c). Then after loading set *0x4c=5, then run.
 
-If you encounter memory errors a solution might be to allocate that memory to the simulator with sim memory-region <address>,<size>
+If you encounter memory errors a solution might be to allocate that memory to the simulator with sim memory-region < address >,< size >
   
     
 
