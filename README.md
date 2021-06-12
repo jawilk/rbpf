@@ -35,6 +35,8 @@ notext -shared --Bdynamic -entry entrypoint -o test_simple_add_vm.so test_simple
      - (gdb) i func - list all available functions
      - (gdb) b <func_name> - set breakpoint at function entry
      - (gdb) set $<register_nr> = < value >    - edit register value (the test always expects return 5 so changing regs will return an error at the very end)
+
+The last instruction (0x95/exit) is not fixed yet and has to be executed 3x (3x stepi) to make the program terminate.  
   
 To inspect an object file to see all instructions: bpf-objdump -d <file_name> or with -S to see debug info aligned.  
 (Any objdump will do (eg llvm-objdump(-12)), but the bpf one is showing the correct opcode mnemonic)
