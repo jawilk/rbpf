@@ -3,7 +3,8 @@
 Simple poc for attaching gdb to rbpf vm. This is very experimental and not all gdb features are supported (see 6). Most code architecture was already done here (see branches) https://github.com/Sladuca/rbpf/tree/main and described here https://github.com/solana-labs/solana/issues/14756
 Only gdb needs to be downloaded and compiled, the other files are in tests/elfs.
 We are using the file tests/elfs/test_simple_add.c for debugging (only 12 instructions)
-1. Compile gdb with bpf target support:
+1. Compile gdb with bpf target support (https://twitter.com/qeole/status/1291026052953911296
+):
     - git clone git://sourceware.org/git/binutils-gdb.git
     - cd binutils-gdb
     - ./configure bpf
@@ -12,10 +13,9 @@ We are using the file tests/elfs/test_simple_add.c for debugging (only 12 instru
 2. Compile tests/elfs/test_simple_add.c for gdb usage:
     - cd tests/elfs
     - clang-12 -O2 -g -emit-llvm -c test_simple_add.c -o - | llc-12 -march=bpf -filetype=obj -o test_simple_add_gdb.o
-https://twitter.com/qeole/status/1291026052953911296
      - strip conflicting elf sections with ./strip_elf.sh (using llvm-objcopy-12)
  3. Compile tests/elfs/test_simple_add.c for vm usage:
-     The following paths do not exist in this repo. I cannot find the current once but the compiled files are already there
+     The following paths do not exist in this repo. I cannot find the current once but the compiled files are already in tests/elfs
      (Taken from https://github.com/solana-labs/rbpf/blob/main/tests/elfs/elfs.sh)
      - /solana/sdk/bpf/dependencies/bpf-tools/llvm/bin/clang -Werror -target bpf -O2 -fno-builtin -fPIC -o test_simple_add_vm.o -c test_simple_add.c
      - /solana/sdk/bpf/dependencies/bpf-tools/llvm/bin/ld.lld -z
@@ -36,6 +36,10 @@ notext -shared --Bdynamic -entry entrypoint -o test_simple_add_vm.so test_simple
      - (gdb) b <func_name> - set breakpoint at function entry
      - (gdb) set $<register_nr> = < value >    - edit register value (the test always expects return 5 so changing regs will return an error at the very end)
   
+To inspect an object file to see all instructions: bpf-objdump -d <file_name> or with -S to see debug info aligned.  
+(Any objdump will do (eg llvm-objdump(-12)), but the bpf one is showing the correct opcode mnemonic)
+  
+    
 
 ![](misc/rbpf_256.png)
 
