@@ -45,13 +45,13 @@ To inspect an object file to see all instructions: bpf-objdump -d <file_name> or
 - For debugging gdb remote: (gdb) set debug remote 1
 - Why clang-12? I was having issues where the dwarf DW_AT_NAME entry was the same for all DIE objects (just the first entry from debug_str). Clang-12 has proper DW_AT_NAME values
 - Syscalls/helper could be added to gdb here https://github.com/bminor/binutils-gdb/blob/master/sim/bpf/bpf.c#L168. Currently only bpf_trace_printk is supported (call 7) eg https://github.com/bminor/binutils-gdb/blob/master/sim/testsuite/bpf/testutils.inc 
-- The order of functions is important so that the bytecode for both compiled versions (see above 2+3) is comparable.
-- (~~Does the simulator support stack frame saving for function calls? It is said that the simulator is supporting all instructions from the testsuite https://github.com/bminor/binutils-gdb/tree/master/sim/testsuite/bpf (no calls) and there is also this comment https://github.com/bminor/binutils-gdb/blob/master/sim/bpf/bpf.c#L158 which let me to believe it is not supported so I went ahead and changed all call instructions (0x85) with ja instructions (0x05) and all exit/return instrutions (0x95) by ja instructions back according to the .rel.text section information (manually using ghex). This is of course a pretty naiv solution since every function can only be called once from within the whole code which is pretty much against the whole idea of a function. It cannot be called twice since the ja instruction can only jump back to one address. This is only my conclusion while skimming the gdb source code and might be wrong due to my limited understanding of gdb/linking processes etc. It turned out when using remote the relocation done already within rbpf is fine and gets propagated back to gdb, pc jumps are decided by the remote. This might only be do to missing linking and not a problem anymore using remote, only sim alone is a problem, but it is included here for future reference~~)
+- The order of functions and the entrypoint within the source file is important so that the bytecode for both compiled versions (see above 2+3) is comparable (or identical).
+- My understandng is that the following is only relevant for target sim, not remote (~~Does the simulator support stack frame saving for function calls? It is said that the simulator is supporting all instructions from the testsuite https://github.com/bminor/binutils-gdb/tree/master/sim/testsuite/bpf (no calls) and there is also this comment https://github.com/bminor/binutils-gdb/blob/master/sim/bpf/bpf.c#L158 which let me to believe it is not supported so I went ahead and changed all call instructions (0x85) with ja instructions (0x05) and all exit/return instrutions (0x95) by ja instructions back according to the .rel.text section information (manually using ghex). This is of course a pretty naiv solution since every function can only be called once from within the whole code which is pretty much against the whole idea of a function. It cannot be called twice since the ja instruction can only jump back to one address. This is only my conclusion while skimming the gdb source code and might be wrong due to my limited understanding of gdb/linking processes etc. It turned out when using remote the relocation done already within rbpf is fine and gets propagated back to gdb, pc jumps are decided by the remote. This might only be do to missing linking and not a problem anymore using remote, only sim alone is a problem, but it is included here for future reference~~)
 - There is also xbpf which is a less restrictive extension and only available (?) for gcc with -mxbpf option. I couldn't find much info about it https://sourceware.org/pipermail/gdb-patches/2020-August/171057.html. There are tests for call instructions here https://github.com/bminor/binutils-gdb/tree/master/gas/testsuite/gas/bpf
 
 ### Using just the simulator
 1. Start gdb
-    - ./gdb/gdb test_simple_add_edit.o (in tests/elfs)
+    - ./gdb/gdb test_simple_add_edit.o (in tests/elfs; edit because call -> ja; exit -> ja)
     - (gdb) target sim
     - (gdb) sim memory-size 4mb
     - (gdb) load
@@ -59,7 +59,7 @@ To inspect an object file to see all instructions: bpf-objdump -d <file_name> or
     - (gbd) run
 
 2. If you want to use input you need to include <linux/bpf.h> and use struct __sk_buff *skb to save the input and skb->data to access it. See tests/elfs/test_simple_input.c. The offset of data within the struct can be modified (https://sourceware.org/gdb/current/onlinedocs/gdb/BPF.html)
-- You need to set the input before running the program but after loading it. The address can be found using objdump -d (eg 0x4c). Then after loading (gdb) set *0x4c=5, then (gdb) run.
+- You need to set the input before running the program but after loading it. The address can be found using objdump -d test_simple_input.o (eg 0x4c (first line)). Then after loading (gdb) set *0x4c=5 (or any other data), then (gdb) run.
 
 If you encounter memory errors a solution might be to allocate that memory to the simulator with (gdb) sim memory-region < address >,< size >
   
