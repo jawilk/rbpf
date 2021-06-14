@@ -12,7 +12,7 @@
 
 use crate::disassembler::disassemble_instruction;
 #[cfg(feature = "debug")]
-use crate::gdb_stub::{start_debug_server, BpfRegs, BreakpointTable, VmReply, VmRequest};
+use crate::gdb_stub::{start_debug_server, BpfRegs, VmReply, VmRequest};
 use crate::static_analysis::Analysis;
 use crate::{
     call_frames::CallFrames,
@@ -39,7 +39,7 @@ use std::{
 struct DebugConfig {
     reply: mpsc::SyncSender<VmReply>,
     req: mpsc::Receiver<VmRequest>,
-    breakpoints: BreakpointTable,
+    breakpoints: Vec<u32>,
     block: bool,
     state: DebugState,
 }
@@ -49,6 +49,7 @@ struct DebugConfig {
 pub enum DebugState {
     Normal,
     Step,
+    Continue,
     Terminating,
     Exited,
 }
@@ -688,18 +689,24 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, E, I> {
     #[cfg(feature = "debug")]
     fn handle_dbg_request(
         &mut self,
-        request: VmRequest,
         debug_config: &mut DebugConfig,
         reg: &mut [u64; 11],
         _vm_addr: u64,
         host_ptr: *mut u8, // Host ptr
         pc: usize,
     ) {
-        match request {
-            /*VmRequest::Resume => {
+        let action = if let Ok(request) = debug_config.req.recv() {
+            request
+        } else {
+            eprintln!("debugger detatched from VM");
+            std::process::exit(1);
+        };
+        match action {
+            VmRequest::Continue => {
                 println!("continue REQUEST");
                 debug_config.block = false;
-            }*/
+                debug_config.state = DebugState::Continue;
+            }
             VmRequest::Step => {
                 println!("step/stepi REQUEST");
                 match debug_config.state {
@@ -748,12 +755,18 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, E, I> {
             }*/
             VmRequest::SetBrkpt(addr) => {
                 println!("Setting breakpoint REQUEST {}", addr);
-                debug_config.breakpoints.set_breakpoint(addr);
+                debug_config.breakpoints.push(addr);
                 debug_config.reply.send(VmReply::SetBrkpt).unwrap();
             }
             VmRequest::RemoveBrkpt(addr) => {
-                debug_config.breakpoints.remove_breakpoint(addr);
-                debug_config.reply.send(VmReply::RemoveBrkpt).unwrap();
+                match debug_config.breakpoints.iter().position(|x| *x == addr) {
+                    // TODO Error handling
+                    None => println!("Breakpoint not found"),
+                    Some(pos) => {
+                        debug_config.breakpoints.remove(pos);
+                        debug_config.reply.send(VmReply::RemoveBrkpt).unwrap();
+                    }
+                }
             }
             /*VmRequest::Offsets => {
                 let res = match self.executable.get_text_bytes() {
@@ -774,17 +787,7 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, E, I> {
                     .send(VmReply::Err("unimplemented"))
                     .unwrap();
             }
-        }
-    }
-
-    #[cfg(feature = "debug")]
-    fn receive_dgb_request(&mut self, req: &mpsc::Receiver<VmRequest>) -> VmRequest {
-        if let Ok(request) = (*req).recv() {
-            return request;
-        } else {
-            eprintln!("debugger detatched from VM");
-            std::process::exit(1);
-        }
+        };
     }
 
     // TODO make this not use unwrap
@@ -800,17 +803,17 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, E, I> {
             debug_config.block = true;
             debug_config.state = DebugState::Normal;
         }
-        println!("Checking for gdb request");
         let host_ptr = translate_memory_access!(self, vm_addr, AccessType::Load, pc, u8);
         while debug_config.block {
-            let request = self.receive_dgb_request(&debug_config.req);
-            self.handle_dbg_request(request, debug_config, reg, vm_addr, host_ptr, pc);
+            self.handle_dbg_request(debug_config, reg, vm_addr, host_ptr, pc);
         }
-        if debug_config.breakpoints.check_breakpoint(pc as u64) {
+        if debug_config.breakpoints.contains(&((pc * 8) as u32)) {
             println!("Program loop breakpoint");
             debug_config.reply.send(VmReply::Breakpoint).unwrap();
-            let request = self.receive_dgb_request(&debug_config.req);
-            self.handle_dbg_request(request, debug_config, reg, vm_addr, host_ptr, pc);
+            if debug_config.state == DebugState::Continue {
+                debug_config.block = true;
+            }
+            self.handle_dbg_request(debug_config, reg, vm_addr, host_ptr, pc);
         }
         Ok(())
     }
@@ -854,7 +857,7 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, E, I> {
         println!("Host ptr: {:?}", host_ptr);
 
         #[cfg(feature = "debug")]
-        let mut debug_config = DebugConfig { reply, req, breakpoints: BreakpointTable::new(), block: true, state: DebugState::Normal };
+        let mut debug_config = DebugConfig { reply, req, breakpoints: Vec::new(), block: true, state: DebugState::Normal };
         // ---------- DEBUGGER -------------
         while next_pc * ebpf::INSN_SIZE + ebpf::INSN_SIZE <= self.program.len() {
             println!("-----------------------------------------------------");
@@ -864,8 +867,10 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, E, I> {
             let mut insn = ebpf::get_insn_unchecked(self.program, pc);
             println!("Program: {:?}", insn);
             println!("Program: reg: {:?} pc: {:?}", reg, pc);
+
             #[cfg(feature = "debug")]
             self.check_for_dbg_request(&mut debug_config, &mut reg, vm_addr, pc).unwrap();
+            
             let dst = insn.dst as usize;
             let src = insn.src as usize;
             self.last_insn_count += 1;
@@ -1180,6 +1185,7 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, E, I> {
         #[cfg(feature = "debug")]
         {
             println!("PROGRAM EXIT");
+            if debug_config.state == DebugState::Continue { debug_config.reply.send(VmReply::Halted(reg[0] as u8)).unwrap(); }
             debug_config.state = DebugState::Terminating;
             debug_config.block = true; 
             self.check_for_dbg_request(&mut debug_config, &mut reg, vm_addr, pc).unwrap();

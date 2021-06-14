@@ -14,13 +14,10 @@ use gdbstub::{
     },
     DisconnectReason, GdbStub, GdbStubError,
 };
-use std::collections::HashSet;
 use std::debug_assert;
 use std::io::Cursor;
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc;
-
-const BRPKT_MAP_THRESH: usize = 30;
 
 /*
 TODO
@@ -82,69 +79,6 @@ fn wait_for_gdb_connection(port: u16) -> std::io::Result<TcpStream> {
 
     eprintln!("Debugger connected from {}", addr);
     Ok(stream)
-}
-
-pub enum BreakpointTable {
-    Few(Vec<u64>),
-    Many(HashSet<u64>),
-}
-
-impl BreakpointTable {
-    pub fn new() -> Self {
-        BreakpointTable::Few(Vec::new())
-    }
-
-    pub fn check_breakpoint(&self, addr: u64) -> bool {
-        match &*self {
-            BreakpointTable::Few(addrs) => {
-                for brkpt_addr in addrs.iter() {
-                    if *brkpt_addr == addr {
-                        return true;
-                    }
-                }
-                return false;
-            }
-            BreakpointTable::Many(addrs) => addrs.contains(&addr),
-        }
-    }
-
-    pub fn set_breakpoint(&mut self, addr: u64) {
-        match *self {
-            BreakpointTable::Few(ref mut addrs) => {
-                if addrs.len() > BRPKT_MAP_THRESH {
-                    let mut set = HashSet::<u64>::with_capacity(addrs.len() + 1);
-                    set.insert(addr);
-                    for addr in addrs.iter() {
-                        set.insert(*addr);
-                    }
-                    *self = BreakpointTable::Many(set);
-                } else {
-                    addrs.push(addr);
-                }
-            }
-            BreakpointTable::Many(ref mut addrs) => {
-                addrs.insert(addr);
-            }
-        }
-    }
-
-    pub fn remove_breakpoint(&mut self, addr: u64) {
-        match *self {
-            BreakpointTable::Few(ref mut addrs) => {
-                if let Some(i) =
-                    addrs
-                        .iter()
-                        .enumerate()
-                        .find_map(|(i, address)| if *address == addr { Some(i) } else { None })
-                {
-                    addrs.remove(i);
-                }
-            }
-            BreakpointTable::Many(ref mut addrs) => {
-                addrs.remove(&addr);
-            }
-        }
-    }
 }
 
 pub struct DebugServer {
@@ -253,7 +187,7 @@ impl Registers for BpfRegs {
 pub struct BpfRegId(u8);
 impl RegId for BpfRegId {
     fn from_raw_id(id: usize) -> Option<(Self, usize)> {
-        println!("FROM RAW ID");
+        println!("FROM RAW IDDDDDDDD");
         if id < 13 {
             Some((BpfRegId(id as u8), 64))
         } else {
@@ -278,14 +212,14 @@ impl From<BpfRegId> for u8 {
 
 #[derive(Debug)]
 pub enum BpfBreakpointKind {
-    Thumb16,
+    BpfBpKindBrkpt,
 }
 
 impl gdbstub::arch::BreakpointKind for BpfBreakpointKind {
     fn from_usize(kind: usize) -> Option<Self> {
         //println!("Brkp kind {}", kind);
         let kind = match kind {
-            0 => BpfBreakpointKind::Thumb16,
+            0 => BpfBreakpointKind::BpfBpKindBrkpt,
             _ => return None,
         };
         Some(kind)
@@ -328,7 +262,7 @@ impl Target for DebugServer {
 
 #[allow(dead_code)]
 pub enum VmRequest {
-    //Resume,
+    Continue,
     //Interrupt,
     Step,
     ReadReg(u8),
@@ -337,8 +271,8 @@ pub enum VmRequest {
     WriteRegs(BpfRegs),
     ReadMem(u64, u64),
     WriteMem(u64, u64, Vec<u8>),
-    SetBrkpt(u64),
-    RemoveBrkpt(u64),
+    SetBrkpt(u32),
+    RemoveBrkpt(u32),
     //Offsets,
     //Detatch,
 }
@@ -348,6 +282,7 @@ pub enum VmReply {
     DoneStep,
     Interrupt,
     Halted(u8),
+    Terminated,
     Breakpoint,
     Err(&'static str),
     ReadRegs(BpfRegs),
@@ -381,14 +316,18 @@ impl SingleThreadOps for DebugServer {
                 }
             }
             ResumeAction::Continue => {
+                self.req.send(VmRequest::Continue).unwrap();
                 loop {
-                    match self.reply.try_recv().unwrap() {
-                        VmReply::Halted(ret_val) => {
+                    match self.reply.try_recv() {
+                        Ok(VmReply::Halted(ret_val)) => {
                             println!("Target HALTED");
                             return Ok(StopReason::Exited(ret_val));
                         }
-                        _ => continue,
-                    };
+                        Ok(VmReply::Breakpoint) => return Ok(StopReason::SwBreak),
+                        Ok(_) => continue,
+                        Err(mpsc::TryRecvError::Disconnected) => (),
+                        Err(mpsc::TryRecvError::Empty) => (),
+                    }
                 }
                 // TODO HERE
                 /*         self.req.send(VmRequest::Resume).unwrap();
@@ -494,7 +433,7 @@ impl SingleRegisterAccess<()> for DebugServer {
         reg_id: BpfRegId,
         dst: &mut [u8],
     ) -> TargetResult<(), Self> {
-        println!("READ SINGLE REGISTER");
+        println!("READ SIIIINGLE REGISTER");
         self.req.send(VmRequest::ReadReg(reg_id.into())).unwrap();
         match self.reply.recv().unwrap() {
             VmReply::ReadReg(val) => {
@@ -540,7 +479,7 @@ impl SwBreakpoint for DebugServer {
         _kind: BpfBreakpointKind,
     ) -> TargetResult<bool, Self> {
         //println!("SERVER BREAKPOINT {}", addr);
-        self.req.send(VmRequest::SetBrkpt(addr)).unwrap();
+        self.req.send(VmRequest::SetBrkpt(addr as u32)).unwrap();
         match self.reply.recv().unwrap() {
             VmReply::SetBrkpt => Ok(true),
             VmReply::Err(e) => Err(TargetError::Fatal(e)),
@@ -554,7 +493,7 @@ impl SwBreakpoint for DebugServer {
         _kind: BpfBreakpointKind,
     ) -> TargetResult<bool, Self> {
         //println!("REM SERVER BREAKPOINT");
-        self.req.send(VmRequest::RemoveBrkpt(addr)).unwrap();
+        self.req.send(VmRequest::RemoveBrkpt(addr as u32)).unwrap();
         match self.reply.recv().unwrap() {
             VmReply::RemoveBrkpt => Ok(true),
             VmReply::Err(e) => Err(TargetError::Fatal(e)),
