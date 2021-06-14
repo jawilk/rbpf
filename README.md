@@ -27,24 +27,22 @@ notext -shared --Bdynamic -entry entrypoint -o test_simple_add_vm.so test_simple
     - (gdb) set disassemble-next-line on
     - (gdb) target remote :9001
 6. Debugging
-     - Please only use stepi/step, c (continue) is not supported yet
      - (gdb) stepi/step - for instruction or line stepping
+     - (gdb) c - for running till breakpoint or termination
      - (gdb) i r - print registers + sp + pc
      - (gdb) i locals - print all variables in current scope (if not optimized out)
-     - Breakpoint on instruction address - (gdb) b *0x20
-     - Breakpoint on line - (gdb) b <line_nr>
+     - (gdb) b *0x20 - Breakpoint on instruction address 
+     - (gdb) b <line_nr> - Breakpoint on line number
      - (gdb) i func - list all available functions
      - (gdb) b <func_name> - set breakpoint at function entry
      - (gdb) set $<register_nr> = < value >    - edit register value (the test always expects return 5 so changing regs will return an error at the very end)
-
-The last instruction (0x95/exit) is not fixed yet and has to be executed 3x (3x stepi) to make the program terminate.  
   
 To inspect an object file to see all instructions: bpf-objdump -d <file_name> or with -S to see debug info aligned.  
 (Any objdump will do (eg llvm-objdump(-12)), but the bpf one is showing the correct opcode mnemonic)
 
 ### Further info
-- gdb remote is expecting 88 byte packages when requesting bpf register information (ie _g request) r0-r9 64bit, then sp 32bit, then pc 32bit
-- For debugging gdb remote: set debug remote 1
+- gdb remote is expecting 88 byte packages when requesting bpf register information (ie _g request) r0-r9 64bit, then sp (r10) 32bit, then pc 32bit
+- For debugging gdb remote: (gdb) set debug remote 1
 - Why clang-12? I was having issues where the dwarf DW_AT_NAME entry was the same for all DIE objects (just the first entry from debug_str). Clang-12 has proper DW_AT_NAME values
 - Syscalls/helper could be added to gdb here https://github.com/bminor/binutils-gdb/blob/master/sim/bpf/bpf.c#L168. Currently only bpf_trace_printk is supported (call 7) eg https://github.com/bminor/binutils-gdb/blob/master/sim/testsuite/bpf/testutils.inc 
 - The order of functions is important so that the bytecode for both compiled versions (see above 2+3) is comparable.
@@ -61,9 +59,9 @@ To inspect an object file to see all instructions: bpf-objdump -d <file_name> or
     - (gbd) run
 
 2. If you want to use input you need to include <linux/bpf.h> and use struct __sk_buff *skb to save the input and skb->data to access it. See tests/elfs/test_simple_input.c. The offset of data within the struct can be modified (https://sourceware.org/gdb/current/onlinedocs/gdb/BPF.html)
-- You need to set the input before running the program but after loading it. The address can be found using objdump -d (eg 0x4c). Then after loading set *0x4c=5, then run.
+- You need to set the input before running the program but after loading it. The address can be found using objdump -d (eg 0x4c). Then after loading (gdb) set *0x4c=5, then (gdb) run.
 
-If you encounter memory errors a solution might be to allocate that memory to the simulator with sim memory-region < address >,< size >
+If you encounter memory errors a solution might be to allocate that memory to the simulator with (gdb) sim memory-region < address >,< size >
   
     
 
