@@ -41,3 +41,5 @@ pub mod user_error;
 pub mod verifier;
 pub mod vm;
 mod x86;
+
+mod gdb_stub;

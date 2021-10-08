@@ -10,6 +10,11 @@
 
 //! Virtual machine and JIT compiler for eBPF programs.
 
+use crate::gdb_stub::{start_debug_server, BpfRegs, VmReply, VmRequest};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
+
 use crate::disassembler::disassemble_instruction;
 use crate::static_analysis::Analysis;
 use crate::{
@@ -28,6 +33,23 @@ use std::{
     fmt::Debug,
     u32,
 };
+
+struct DebugConfig {
+    reply: mpsc::SyncSender<VmReply>,
+    req: mpsc::Receiver<VmRequest>,
+    breakpoints: Vec<u32>,
+    block: bool,
+    state: DebugState,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum DebugState {
+    Normal,
+    Step,
+    Continue,
+    Terminating,
+    Exited,
+}
 
 /// eBPF verification function that returns an error if the program does not meet its requirements.
 ///
@@ -627,6 +649,161 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, E, I> {
             .map(|slot| self.syscall_context_objects[SYSCALL_CONTEXT_OBJECTS_OFFSET + slot])
     }
 
+    fn handle_dbg_request(
+        &mut self,
+        debug_config: &mut DebugConfig,
+        reg: &mut [u64; 11],
+        _vm_addr: u64,
+        host_ptr: *mut u8, // Host ptr
+        pc: usize,
+    ) {
+        let action = if let Ok(request) = debug_config.req.recv() {
+            request
+        } else {
+            eprintln!("debugger detatched from VM");
+            debug_config.block = false;
+            println!("EXIT DEBUG");
+            return;
+            //std::process::exit(1);
+        };
+        match action {
+            VmRequest::Continue => {
+                println!("continue REQUEST");
+                debug_config.block = false;
+                debug_config.state = DebugState::Continue;
+            }
+            VmRequest::Step => {
+                println!("step/stepi REQUEST");
+                match debug_config.state {
+                    DebugState::Terminating => {
+                        debug_config.state = DebugState::Exited;
+                        debug_config
+                            .reply
+                            .send(VmReply::Halted(reg[0] as u8))
+                            .unwrap();
+                    }
+                    _ => debug_config.reply.send(VmReply::DoneStep).unwrap(),
+                };
+                debug_config.block = false;
+                debug_config.state = DebugState::Step;
+            }
+            VmRequest::ReadMem(start_addr, len) => {
+                println!("Request for MEM: {:x} {:x}", start_addr, len);
+                let adj_ptr = unsafe { host_ptr.offset(((start_addr as isize) - 232) as isize) };
+                //let adj_ptr = host_ptr.wrapping_sub(24);
+                println!("Adj pointer: {:x}", adj_ptr as usize);
+                let read_mem = unsafe { std::slice::from_raw_parts(adj_ptr, len as usize) };
+                //println!("Read mem: {:?}", read_mem);
+                debug_config.reply.send(VmReply::ReadMem(read_mem)).unwrap();
+            }
+            VmRequest::ReadRegs => {
+                let mut regs_only: [u64; 10] = Default::default();
+                regs_only.copy_from_slice(&reg[..10]);
+
+                //let mut gdb_pc = (pc * 8) as u32;
+                //if debug_config.is_entry_offset && debug_config.state == DebugState::Init {
+                //   gdb_pc -= 8;
+                //   debug_config.state = DebugState::Normal;
+                //}
+                debug_config
+                    .reply
+                    .send(VmReply::ReadRegs(BpfRegs {
+                        r: regs_only,
+                        sp: reg[10] as u32, //- 8589938688;
+                        //pc: (pc * 8) as u32,         // C
+                        pc: ((8 * pc) + 232) as u32, // RUST (+offset 232) 2440
+                    }))
+                    .unwrap();
+            }
+            VmRequest::WriteReg(reg_id, value) => {
+                println!("Writing value {} reg {} REQUEST", value, reg_id);
+                reg[reg_id as usize] = value;
+                debug_config.reply.send(VmReply::WriteReg).unwrap();
+            }
+            /*VmRequest::Interrupt => {
+                debug_config.reply.send(VmReply::Interrupt).unwrap();
+                self.check_for_dbg_request(debug_config, reg, vm_addr, pc);
+            }*/
+            VmRequest::SetBrkpt(addr) => {
+                println!("Setting breakpoint REQUEST {}", addr);
+                debug_config.breakpoints.push(addr);
+                debug_config.reply.send(VmReply::SetBrkpt).unwrap();
+            }
+            VmRequest::RemoveBrkpt(addr) => {
+                match debug_config.breakpoints.iter().position(|x| *x == addr) {
+                    // TODO Error handling
+                    None => println!("Breakpoint not found"),
+                    Some(pos) => {
+                        debug_config.breakpoints.remove(pos);
+                        debug_config.reply.send(VmReply::RemoveBrkpt).unwrap();
+                    }
+                }
+            }
+            /*VmRequest::Offsets => {
+                let res = match self.executable.get_text_bytes() {
+                    Ok(text) => {
+                        let (text, _) = text;
+                        VmReply::Offsets(Offsets::Segments {
+                            text_seg: text,
+                            data_seg: None,
+                        })
+                    }
+                    Err(_) => VmReply::Err("could not fetch offsets"),
+                };
+                debug_config.reply.send(res).unwrap();
+            }*/
+            _ => {
+                debug_config
+                    .reply
+                    .send(VmReply::Err("unimplemented"))
+                    .unwrap();
+            }
+        };
+    }
+
+    fn check_for_dbg_request(
+        &mut self,
+        debug_config: &mut DebugConfig,
+        reg: &mut [u64; 11],
+        vm_addr: u64,
+        pc: usize,
+    ) -> Result<(), EbpfError<E>> {
+        if debug_config.state == DebugState::Step {
+            debug_config.block = true;
+            debug_config.state = DebugState::Normal;
+        }
+        let host_ptr = translate_memory_access!(self, vm_addr, AccessType::Load, pc, u8);
+        while debug_config.block {
+            self.handle_dbg_request(debug_config, reg, vm_addr, host_ptr, pc);
+        }
+        if debug_config.breakpoints.contains(&((pc * 8) as u32)) {
+            println!("Program loop breakpoint");
+            debug_config.reply.send(VmReply::Breakpoint).unwrap();
+            if debug_config.state == DebugState::Continue {
+                debug_config.block = true;
+            }
+            self.handle_dbg_request(debug_config, reg, vm_addr, host_ptr, pc);
+        }
+        Ok(())
+    }
+
+    pub fn execute_program_interpreted_debug(&mut self, instruction_meter: I) {
+        //-> ProgramResult<E> {
+        println!("execute_program_interpreted_debug");
+        thread::sleep(Duration::from_millis(100000));
+        /*let initial_insn_count = if self.executable.get_config().enable_instruction_meter {
+            instruction_meter.get_remaining()
+        } else {
+            0
+        };
+        let result = self.execute_program_interpreted_inner(instruction_meter);
+        if self.executable.get_config().enable_instruction_meter {
+            instruction_meter.consume(self.last_insn_count);
+            self.total_insn_count = initial_insn_count - instruction_meter.get_remaining();
+        }
+        result*/
+    }
+
     /// Execute the program loaded, with the given packet data.
     ///
     /// Warning: The program is executed without limiting the number of
@@ -673,6 +850,7 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, E, I> {
         &mut self,
         instruction_meter: &mut I,
     ) -> ProgramResult<E> {
+        println!("RBPF INTERPRETER");
         const U32MAX: u64 = u32::MAX as u64;
 
         // R1 points to beginning of input memory, R10 to the stack of the first frame
@@ -693,10 +871,36 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, E, I> {
         let initial_insn_count = remaining_insn_count;
         self.last_insn_count = 0;
         let mut total_insn_count = 0;
+
+// ---------- DEBUGGER -------------
+        println!("CONNECTING");
+        let (reply, req) = start_debug_server(9001, &reg, next_pc as u64);
+        println!("pc: {}", next_pc);
+        println!("Regs: {:?}", reg);
+        println!("Memory address prog: {}", self.program_vm_addr);
+        //let vm_addr = self.program_vm_addr.wrapping_add((entry*8) as u64);//ebpf::MM_PROGRAM_START;
+        let vm_addr = self.program_vm_addr;
+        println!("start: {}", vm_addr);
+        //let temp_pc = next_pc-8;
+        let host_ptr = translate_memory_access!(self, vm_addr, AccessType::Load, next_pc, u8);
+        ////let host_ptr = translate_memory_access!(self, vm_addr, AccessType::Load, temp_pc, u8);
+                //let adj_ptr = unsafe { host_ptr.offset(8 as isize) };
+                let read_mem = unsafe { std::slice::from_raw_parts(host_ptr, 128 as usize) };
+                println!("mem {:x?}", read_mem);
+        println!("Host ptr: {:?}", host_ptr);
+        let mut debug_config = DebugConfig { reply, req, breakpoints: Vec::new(), block: true, state: DebugState::Normal };
+        // ---------- DEBUGGER -------------
+
         while next_pc * ebpf::INSN_SIZE + ebpf::INSN_SIZE <= self.program.len() {
             let pc = next_pc;
             next_pc += 1;
             let mut insn = ebpf::get_insn_unchecked(self.program, pc);
+
+            println!("Program: {:?}", insn);
+            println!("Program: reg: {:?} pc: {:?}", reg, pc);
+            self.check_for_dbg_request(&mut debug_config, &mut reg, vm_addr, pc).unwrap();
+           
+
             let dst = insn.dst as usize;
             let src = insn.src as usize;
             self.last_insn_count += 1;
@@ -1008,6 +1212,14 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, E, I> {
                                 "Max frame depth reached: {:?}",
                                 self.frames.get_max_frame_index()
                             );
+ {
+            println!("PROGRAM EXIT");
+            if debug_config.state == DebugState::Continue { debug_config.reply.send(VmReply::Halted(reg[0] as u8)).unwrap(); }
+            debug_config.state = DebugState::Terminating;
+            debug_config.block = true; 
+            self.check_for_dbg_request(&mut debug_config, &mut reg, vm_addr, pc).unwrap();
+        }
+        println!("EXIT PROGRAM LOOP");
                             return Ok(reg[0]);
                         }
                     }
@@ -1050,6 +1262,7 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, E, I> {
     /// the program works with the interpreter before running the JIT-compiled version of it.
     ///
     pub fn execute_program_jit(&mut self, instruction_meter: &mut I) -> ProgramResult<E> {
+        println!("RBPF JIT");
         let reg1 = if self
             .memory_mapping
             .map::<UserError>(AccessType::Store, ebpf::MM_INPUT_START, 1)
@@ -1086,6 +1299,7 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, E, I> {
             instruction_meter.consume(self.total_insn_count);
             self.total_insn_count += initial_insn_count - remaining_insn_count;
         }
+        println!("RBPF JIT END");
         match result {
             Err(EbpfError::ExceededMaxInstructions(pc, _)) => {
                 Err(EbpfError::ExceededMaxInstructions(pc, initial_insn_count))
