@@ -1,4 +1,4 @@
-# solana_rbpf (gdb)
+# solana_rbpf (gdb support, see debugger branch)
 
 Simple poc for attaching gdb to rbpf vm (tested on Ubuntu 18.04). This is very experimental and not all gdb features are supported (see 6). Most code architecture was already done here (see branches) https://github.com/Sladuca/rbpf/tree/main and described here https://github.com/solana-labs/solana/issues/14756
 Only gdb needs to be downloaded and compiled, the other files are in tests/elfs.
