@@ -1,3 +1,68 @@
+# solana_rbpf (gdb support, see debugger branch)
+
+Simple poc for attaching gdb to rbpf vm (tested on Ubuntu 18.04). This is very experimental and not all gdb features are supported (see 6). Most code architecture was already done here (see branches) https://github.com/Sladuca/rbpf/tree/main and described here https://github.com/solana-labs/solana/issues/14756
+Only gdb needs to be downloaded and compiled, the other files are in tests/elfs.
+We are using the file tests/elfs/test_simple_add.c for debugging (only 12 instructions)
+1. Compile gdb with bpf target support (https://twitter.com/qeole/status/1291026052953911296
+):
+    - git clone git://sourceware.org/git/binutils-gdb.git
+    - cd binutils-gdb
+    - ./configure bpf
+    - make    
+2. (2+3 can be skipped, the files are already in tests/elfs directory)
+Compile tests/elfs/test_simple_add.c for gdb usage:
+    - cd tests/elfs
+    - clang-12 -O2 -g -emit-llvm -c test_simple_add.c -o - | llc-12 -march=bpf -filetype=obj -o test_simple_add_gdb.o
+     - strip conflicting elf sections with ./strip_elf.sh (using llvm-objcopy-12)
+ 3. Compile tests/elfs/test_simple_add.c for vm usage:
+     The following paths do not exist in this repo. I cannot find the current once but the compiled files are already in tests/elfs
+     (Taken from https://github.com/solana-labs/rbpf/blob/main/tests/elfs/elfs.sh)
+     - /solana/sdk/bpf/dependencies/bpf-tools/llvm/bin/clang -Werror -target bpf -O2 -fno-builtin -fPIC -o test_simple_add_vm.o -c test_simple_add.c
+     - /solana/sdk/bpf/dependencies/bpf-tools/llvm/bin/ld.lld -z
+notext -shared --Bdynamic -entry entrypoint -o test_simple_add_vm.so test_simple_add_vm.o
+4. Start vm with debugging support:
+    - cargo run --example test_gdb --features debug
+5. Start gdb
+    - ./gdb/gdb test_simple_add_gdb.o (in tests/elfs)
+    - (gdb) set disassemble-next-line on
+    - (gdb) target remote :9001
+6. Debugging
+     - (gdb) stepi/step - for instruction or line stepping
+     - (gdb) c - for running till breakpoint or termination
+     - (gdb) i r - print registers + sp + pc
+     - (gdb) i locals - print all variables in current scope (if not optimized out)
+     - (gdb) b *0x20 - Breakpoint on instruction address 
+     - (gdb) b <line_nr> - Breakpoint on line number
+     - (gdb) i func - list all available functions
+     - (gdb) b <func_name> - set breakpoint at function entry
+     - (gdb) set $<register_nr> = < value >    - edit register value (the test always expects return 5 so changing regs will return an error at the very end)
+  
+To inspect an object file to see all instructions: bpf-objdump -d <file_name> or with -S to see debug info aligned.  
+(Any objdump will do (eg llvm-objdump(-12)), but the bpf one is showing the correct opcode mnemonic)
+
+### Further info
+- gdb remote is expecting 88 byte packages when requesting bpf register information (ie _g request) r0-r9 64bit, then sp (r10) 32bit, then pc 32bit
+- For debugging gdb remote: (gdb) set debug remote 1
+- Why clang-12? I was having issues where the dwarf DW_AT_NAME entry was the same for all DIE objects (just the first entry from debug_str). Clang-12 has proper DW_AT_NAME values
+- Syscalls/helper could be added to gdb here https://github.com/bminor/binutils-gdb/blob/master/sim/bpf/bpf.c#L168. Currently only bpf_trace_printk is supported (call 7) eg https://github.com/bminor/binutils-gdb/blob/master/sim/testsuite/bpf/testutils.inc 
+- The order of functions and the entrypoint within the source file is important so that the bytecode for both compiled versions (see above 2+3) is comparable (or identical).
+- My understanding is that the following is only relevant for target sim, not remote (~~Does the simulator support stack frame saving for function calls? It is said that the simulator is supporting all instructions from the testsuite https://github.com/bminor/binutils-gdb/tree/master/sim/testsuite/bpf (no calls) and there is also this comment https://github.com/bminor/binutils-gdb/blob/master/sim/bpf/bpf.c#L158 which let me to believe it is not supported so I went ahead and changed all call instructions (0x85) with ja instructions (0x05) and all exit/return instrutions (0x95) by ja instructions back according to the .rel.text section information (manually using ghex). This is of course a pretty naiv solution since every function can only be called once from within the whole code which is pretty much against the whole idea of a function. It cannot be called twice since the ja instruction can only jump back to one address. This is only my conclusion while skimming the gdb source code and might be wrong due to my limited understanding of gdb/linking processes etc. It turned out when using remote the relocation done already within rbpf is fine and gets propagated back to gdb, pc jumps are decided by the remote. This might only be do to missing linking and not a problem anymore using remote, only sim alone is a problem, but it is included here for future reference~~)
+- There is also xbpf which is a less restrictive extension and only available (?) for gcc with -mxbpf option. I couldn't find much info about it https://sourceware.org/pipermail/gdb-patches/2020-August/171057.html. There are tests for call instructions here https://github.com/bminor/binutils-gdb/tree/master/gas/testsuite/gas/bpf
+
+### Using just the simulator
+1. Start gdb
+    - ./gdb/gdb test_simple_add_edit.o (in tests/elfs; edit because call -> ja; exit -> ja)
+    - (gdb) target sim
+    - (gdb) sim memory-size 4mb
+    - (gdb) load
+    - breakpoints etc
+    - (gbd) run
+
+2. If you want to use input you need to include <linux/bpf.h> and use struct __sk_buff *skb to save the input and skb->data to access it. See tests/elfs/test_simple_input.c. The offset of data within the struct can be modified (https://sourceware.org/gdb/current/onlinedocs/gdb/BPF.html)
+- You need to set the input before running the program but after loading it. The address can be found using objdump -d test_simple_input.o (eg 0x4c (first line)). Then after loading (gdb) set *0x4c=5 (or any other data), then (gdb) run.
+
+If you encounter memory errors a solution might be to allocate that memory to the simulator with (gdb) sim memory-region < address >,< size >
+
 # solana_rbpf
 
 ![](misc/rbpf_256.png)
