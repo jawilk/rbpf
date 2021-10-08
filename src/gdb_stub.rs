@@ -269,7 +269,7 @@ pub enum VmRequest {
     ReadRegs,
     WriteReg(u8, u64),
     WriteRegs(BpfRegs),
-    ReadMem(u64, u64),
+    ReadMem(u64, u64), // TODO: Change to isize
     WriteMem(u64, u64, Vec<u8>),
     SetBrkpt(u32),
     RemoveBrkpt(u32),
@@ -362,7 +362,7 @@ impl SingleThreadOps for DebugServer {
         match self.reply.recv().unwrap() {
             VmReply::ReadRegs(BpfRegs { r, sp, pc }) => {
                 println!(
-                    "Sending back to gdb {:?} sp {:x?} pc {:x?} (hex)",
+                    "Sending back to gdb {:x?} sp {:x?} pc {:x?} (hex)",
                     r, sp, pc
                 );
                 regs.r = r;
@@ -397,6 +397,7 @@ impl SingleThreadOps for DebugServer {
             .unwrap();
         match self.reply.recv().unwrap() {
             VmReply::ReadMem(bytes) => {
+                println!("READ {:x?}", bytes);
                 debug_assert!(
                     bytes.len() == dst.len(),
                     "vm returned wrong number of bytes!"
