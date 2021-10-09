@@ -30,6 +30,8 @@ scroll = "0.10.1"
 thiserror = "1.0"
 time = "0.1"
 rustc-demangle = "0.1"
+gdbstub = "0.5"
+gdbstub_arch = "0.1.0"
 
 [dev-dependencies]
 elf = "0.0.10"
