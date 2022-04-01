@@ -1,3 +1,4 @@
+#![allow(clippy::integer_arithmetic)]
 // Copyright 2020 Solana Maintainers <maintainers@solana.com>
 //
 // Licensed under the Apache License, Version 2.0 <http://www.apache.org/licenses/LICENSE-2.0> or
@@ -10,19 +11,21 @@ extern crate solana_rbpf;
 extern crate test_utils;
 extern crate thiserror;
 
+use byteorder::{ByteOrder, LittleEndian};
 #[cfg(all(not(windows), target_arch = "x86_64"))]
 use rand::{rngs::SmallRng, RngCore, SeedableRng};
 use solana_rbpf::{
     assembler::assemble,
-    elf::ElfError,
+    ebpf,
+    elf::{register_bpf_function, ElfError, Executable},
     error::EbpfError,
     memory_region::AccessType,
     memory_region::MemoryMapping,
     syscalls::{self, Result},
     user_error::UserError,
-    vm::{Config, EbpfVm, Executable, SyscallObject, SyscallRegistry, TestInstructionMeter},
+    vm::{Config, EbpfVm, SyscallObject, SyscallRegistry, TestInstructionMeter},
 };
-use std::{fs::File, io::Read};
+use std::{collections::BTreeMap, fs::File, io::Read};
 use test_utils::{PROG_TCP_PORT_80, TCP_SACK_ASM, TCP_SACK_MATCH, TCP_SACK_NOMATCH};
 
 macro_rules! test_interpreter_and_jit {
@@ -33,10 +36,11 @@ macro_rules! test_interpreter_and_jit {
         $vm.bind_syscall_context_object(Box::new($syscall_context_object), None).unwrap();
     };
     ($executable:expr, $mem:tt, ($($location:expr => $syscall_function:expr; $syscall_context_object:expr),* $(,)?), $check:block, $expected_instruction_count:expr) => {
-        let check_closure = $check;
+        #[allow(unused_mut)]
+        let mut check_closure = $check;
         let (instruction_count_interpreter, _tracer_interpreter) = {
             let mut mem = $mem;
-            let mut vm = EbpfVm::new($executable.as_ref(), &mut [], &mut mem).unwrap();
+            let mut vm = EbpfVm::new(&$executable, &mut [], &mut mem).unwrap();
             $(test_interpreter_and_jit!(bind, vm, $location => $syscall_function; $syscall_context_object);)*
             let result = vm.execute_program_interpreted(&mut TestInstructionMeter { remaining: $expected_instruction_count });
             assert!(check_closure(&vm, result));
@@ -44,10 +48,11 @@ macro_rules! test_interpreter_and_jit {
         };
         #[cfg(all(not(windows), target_arch = "x86_64"))]
         {
-            let check_closure = $check;
-            let compilation_result = $executable.jit_compile();
+            #[allow(unused_mut)]
+            let mut check_closure = $check;
+            let compilation_result = Executable::<UserError, TestInstructionMeter>::jit_compile(&mut $executable);
             let mut mem = $mem;
-            let mut vm = EbpfVm::new($executable.as_ref(), &mut [], &mut mem).unwrap();
+            let mut vm = EbpfVm::new(&$executable, &mut [], &mut mem).unwrap();
             match compilation_result {
                 Err(err) => assert!(check_closure(&vm, Err(err))),
                 Ok(()) => {
@@ -55,7 +60,7 @@ macro_rules! test_interpreter_and_jit {
                     let result = vm.execute_program_jit(&mut TestInstructionMeter { remaining: $expected_instruction_count });
                     let tracer_jit = vm.get_tracer();
                     if !check_closure(&vm, result) || !solana_rbpf::vm::Tracer::compare(&_tracer_interpreter, tracer_jit) {
-                        let analysis = solana_rbpf::static_analysis::Analysis::from_executable($executable.as_ref());
+                        let analysis = solana_rbpf::static_analysis::Analysis::from_executable(&$executable);
                         let stdout = std::io::stdout();
                         _tracer_interpreter.write(&mut stdout.lock(), &analysis).unwrap();
                         tracer_jit.write(&mut stdout.lock(), &analysis).unwrap();
@@ -75,6 +80,15 @@ macro_rules! test_interpreter_and_jit {
 }
 
 macro_rules! test_interpreter_and_jit_asm {
+    ($source:tt, $config:tt, $mem:tt, ($($location:expr => $syscall_function:expr; $syscall_context_object:expr),* $(,)?), $check:block, $expected_instruction_count:expr) => {
+        #[allow(unused_mut)]
+        {
+            let mut syscall_registry = SyscallRegistry::default();
+            $(test_interpreter_and_jit!(register, syscall_registry, $location => $syscall_function; $syscall_context_object);)*
+            let mut executable = assemble($source, None, $config, syscall_registry).unwrap();
+            test_interpreter_and_jit!(executable, $mem, ($($location => $syscall_function; $syscall_context_object),*), $check, $expected_instruction_count);
+        }
+    };
     ($source:tt, $mem:tt, ($($location:expr => $syscall_function:expr; $syscall_context_object:expr),* $(,)?), $check:block, $expected_instruction_count:expr) => {
         #[allow(unused_mut)]
         {
@@ -82,30 +96,30 @@ macro_rules! test_interpreter_and_jit_asm {
                 enable_instruction_tracing: true,
                 ..Config::default()
             };
-            let mut syscall_registry = SyscallRegistry::default();
-            $(test_interpreter_and_jit!(register, syscall_registry, $location => $syscall_function; $syscall_context_object);)*
-            let mut executable = assemble($source, None, config, syscall_registry).unwrap();
-            test_interpreter_and_jit!(executable, $mem, ($($location => $syscall_function; $syscall_context_object),*), $check, $expected_instruction_count);
+            test_interpreter_and_jit_asm!($source, config, $mem, ($($location => $syscall_function; $syscall_context_object),*), $check, $expected_instruction_count);
         }
     };
 }
 
 macro_rules! test_interpreter_and_jit_elf {
-    ($source:tt, $mem:tt, ($($location:expr => $syscall_function:expr; $syscall_context_object:expr),* $(,)?), $check:block, $expected_instruction_count:expr) => {
+    ($source:tt, $config:tt, $mem:tt, ($($location:expr => $syscall_function:expr; $syscall_context_object:expr),* $(,)?), $check:block, $expected_instruction_count:expr) => {
         let mut file = File::open($source).unwrap();
         let mut elf = Vec::new();
         file.read_to_end(&mut elf).unwrap();
         #[allow(unused_mut)]
         {
-            let config = Config {
-                enable_instruction_tracing: true,
-                ..Config::default()
-            };
             let mut syscall_registry = SyscallRegistry::default();
             $(test_interpreter_and_jit!(register, syscall_registry, $location => $syscall_function; $syscall_context_object);)*
-            let mut executable = <dyn Executable::<UserError, TestInstructionMeter>>::from_elf(&elf, None, config, syscall_registry).unwrap();
+            let mut executable = Executable::<UserError, TestInstructionMeter>::from_elf(&elf, None, $config, syscall_registry).unwrap();
             test_interpreter_and_jit!(executable, $mem, ($($location => $syscall_function; $syscall_context_object),*), $check, $expected_instruction_count);
         }
+    };
+    ($source:tt, $mem:tt, ($($location:expr => $syscall_function:expr; $syscall_context_object:expr),* $(,)?), $check:block, $expected_instruction_count:expr) => {
+        let config = Config {
+            enable_instruction_tracing: true,
+            ..Config::default()
+        };
+        test_interpreter_and_jit_elf!($source, config, $mem, ($($location => $syscall_function; $syscall_context_object),*), $check, $expected_instruction_count);
     };
 }
 
@@ -759,6 +773,35 @@ fn test_div32_reg() {
 }
 
 #[test]
+fn test_sdiv32_imm() {
+    test_interpreter_and_jit_asm!(
+        "
+        lddw r0, 0x10000000c
+        sdiv32 r0, 4
+        exit",
+        [],
+        (),
+        { |_vm, res: Result| { res.unwrap() == 0x3 } },
+        3
+    );
+}
+
+#[test]
+fn test_sdiv32_reg() {
+    test_interpreter_and_jit_asm!(
+        "
+        lddw r0, 0x10000000c
+        mov r1, 4
+        sdiv32 r0, r1
+        exit",
+        [],
+        (),
+        { |_vm, res: Result| { res.unwrap() == 0x3 } },
+        4
+    );
+}
+
+#[test]
 fn test_div64_imm() {
     test_interpreter_and_jit_asm!(
         "
@@ -790,6 +833,37 @@ fn test_div64_reg() {
 }
 
 #[test]
+fn test_sdiv64_imm() {
+    test_interpreter_and_jit_asm!(
+        "
+        mov r0, 0xc
+        lsh r0, 32
+        sdiv r0, 4
+        exit",
+        [],
+        (),
+        { |_vm, res: Result| { res.unwrap() == 0x300000000 } },
+        4
+    );
+}
+
+#[test]
+fn test_sdiv64_reg() {
+    test_interpreter_and_jit_asm!(
+        "
+        mov r0, 0xc
+        lsh r0, 32
+        mov r1, 4
+        sdiv r0, r1
+        exit",
+        [],
+        (),
+        { |_vm, res: Result| { res.unwrap() == 0x300000000 } },
+        5
+    );
+}
+
+#[test]
 fn test_err_div64_by_zero_reg() {
     test_interpreter_and_jit_asm!(
         "
@@ -805,7 +879,7 @@ fn test_err_div64_by_zero_reg() {
 }
 
 #[test]
-fn test_err_div_by_zero_reg() {
+fn test_err_div32_by_zero_reg() {
     test_interpreter_and_jit_asm!(
         "
         mov32 r0, 1
@@ -816,6 +890,106 @@ fn test_err_div_by_zero_reg() {
         (),
         { |_vm, res: Result| matches!(res.unwrap_err(), EbpfError::DivideByZero(pc) if pc == 31) },
         3
+    );
+}
+
+#[test]
+fn test_err_sdiv64_by_zero_reg() {
+    test_interpreter_and_jit_asm!(
+        "
+        mov32 r0, 1
+        mov32 r1, 0
+        sdiv r0, r1
+        exit",
+        [],
+        (),
+        { |_vm, res: Result| matches!(res.unwrap_err(), EbpfError::DivideByZero(pc) if pc == 31) },
+        3
+    );
+}
+
+#[test]
+fn test_err_sdiv32_by_zero_reg() {
+    test_interpreter_and_jit_asm!(
+        "
+        mov32 r0, 1
+        mov32 r1, 0
+        sdiv32 r0, r1
+        exit",
+        [],
+        (),
+        { |_vm, res: Result| matches!(res.unwrap_err(), EbpfError::DivideByZero(pc) if pc == 31) },
+        3
+    );
+}
+
+#[test]
+fn test_err_sdiv64_overflow_imm() {
+    test_interpreter_and_jit_asm!(
+        "
+        mov r0, 0x80
+        lsh r0, 56
+        sdiv r0, -1
+        exit",
+        [],
+        (),
+        {
+            |_vm, res: Result| matches!(res.unwrap_err(), EbpfError::DivideOverflow(pc) if pc == 31)
+        },
+        3
+    );
+}
+
+#[test]
+fn test_err_sdiv64_overflow_reg() {
+    test_interpreter_and_jit_asm!(
+        "
+        mov r0, 0x80
+        lsh r0, 56
+        mov r1, -1
+        sdiv r0, r1
+        exit",
+        [],
+        (),
+        {
+            |_vm, res: Result| matches!(res.unwrap_err(), EbpfError::DivideOverflow(pc) if pc == 32)
+        },
+        4
+    );
+}
+
+#[test]
+fn test_err_sdiv32_overflow_imm() {
+    test_interpreter_and_jit_asm!(
+        "
+        mov r0, 0x80
+        lsh r0, 24
+        sdiv32 r0, -1
+        exit",
+        [],
+        (),
+        {
+            |_vm, res: Result| matches!(res.unwrap_err(), EbpfError::DivideOverflow(pc) if pc == 31)
+        },
+        3
+    );
+}
+
+#[test]
+fn test_err_sdiv32_overflow_reg() {
+    test_interpreter_and_jit_asm!(
+        "
+        mov r0, 0x80
+        lsh r0, 24
+        mov r1, -1
+        sdiv32 r0, r1
+        exit",
+        [],
+        (),
+        {
+            |_vm, res: Result| matches!(res.unwrap_err(), EbpfError::DivideOverflow(pc) if pc == 32)
+        },
+        4
     );
 }
 
@@ -1422,10 +1596,6 @@ fn test_lddw() {
         { |_vm, res: Result| { res.unwrap() == 0x1122334455667788 } },
         2
     );
-}
-
-#[test]
-fn test_lddw2() {
     test_interpreter_and_jit_asm!(
         "
         lddw r0, 0x0000000080000000
@@ -2250,7 +2420,7 @@ fn test_string_stack() {
 }
 
 #[test]
-fn test_err_stack_out_of_bound() {
+fn test_err_fixed_stack_out_of_bound() {
     test_interpreter_and_jit_asm!(
         "
         stb [r10-0x4000], 0
@@ -2267,6 +2437,298 @@ fn test_err_stack_out_of_bound() {
         },
         1
     );
+}
+
+#[test]
+fn test_err_dynamic_stack_out_of_bound() {
+    let config = Config {
+        dynamic_stack_frames: true,
+        max_call_depth: 3,
+        ..Config::default()
+    };
+
+    // The stack goes from MM_STACK_START + config.stack_size() to MM_STACK_START
+
+    // Check that accessing MM_STACK_START - 1 fails
+    test_interpreter_and_jit_asm!(
+        "
+        stb [r10-0x3001], 0
+        exit",
+        config,
+        [],
+        (),
+        {
+            |_vm, res: Result| {
+                matches!(res.unwrap_err(),
+                    EbpfError::AccessViolation(pc, access_type, vm_addr, len, region)
+                    if access_type == AccessType::Store && pc == 29 && vm_addr == ebpf::MM_STACK_START - 1 && len == 1 && region == "program"
+                )
+            }
+        },
+        1
+    );
+
+    // Check that accessing MM_STACK_START + expected_stack_len fails
+    test_interpreter_and_jit_asm!(
+        "
+        stb [r10], 0
+        exit",
+        config,
+        [],
+        (),
+        {
+            |_vm, res: Result| {
+                matches!(res.unwrap_err(),
+                    EbpfError::AccessViolation(pc, access_type, vm_addr, len, region)
+                    if access_type == AccessType::Store && pc == 29 && vm_addr == ebpf::MM_STACK_START + config.stack_size() as u64 && len == 1 && region == "stack"
+                )
+            }
+        },
+        1
+    );
+}
+
+#[test]
+fn test_err_dynamic_stack_ptr_overflow() {
+    let config = Config {
+        dynamic_stack_frames: true,
+        ..Config::default()
+    };
+
+    // See the comment in CallFrames::resize_stack() for the reason why it's
+    // safe to let the stack pointer overflow
+
+    // stack_ptr -= stack_ptr + 1
+    test_interpreter_and_jit_asm!(
+        "
+        sub r11, 0x7FFFFFFF
+        sub r11, 0x7FFFFFFF
+        sub r11, 0x7FFFFFFF
+        sub r11, 0x7FFFFFFF
+        sub r11, 0x14005
+        call foo
+        exit
+        foo:
+        stb [r10], 0
+        exit",
+        config,
+        [],
+        (),
+        {
+            |_vm, res: Result| {
+                matches!(res.unwrap_err(),
+                    EbpfError::AccessViolation(pc, access_type, vm_addr, len, region)
+                    if access_type == AccessType::Store && pc == 29 + 7 && vm_addr == u64::MAX && len == 1 && region == "unknown"
+                )
+            }
+        },
+        7
+    );
+}
+
+#[test]
+fn test_dynamic_stack_frames_empty() {
+    let config = Config {
+        dynamic_stack_frames: true,
+        ..Config::default()
+    };
+
+    // Check that unless explicitly resized the stack doesn't grow
+    test_interpreter_and_jit_asm!(
+        "
+        call foo
+        exit
+        foo:
+        mov r0, r10
+        exit",
+        config,
+        [],
+        (),
+        { |_vm, res: Result| res.unwrap() == ebpf::MM_STACK_START + config.stack_size() as u64 },
+        4
+    );
+}
+
+#[test]
+fn test_dynamic_frame_ptr() {
+    let config = Config {
+        dynamic_stack_frames: true,
+        ..Config::default()
+    };
+
+    // Check that upon entering a function (foo) the frame pointer is advanced
+    // to the top of the stack
+    test_interpreter_and_jit_asm!(
+        "
+        sub r11, 8
+        call foo
+        exit
+        foo:
+        mov r0, r10
+        exit",
+        config,
+        [],
+        (),
+        {
+            |_vm, res: Result| res.unwrap() == ebpf::MM_STACK_START + config.stack_size() as u64 - 8
+        },
+        5
+    );
+
+    // And check that when exiting a function (foo) the caller's frame pointer
+    // is restored
+    test_interpreter_and_jit_asm!(
+        "
+        sub r11, 8
+        call foo
+        mov r0, r10
+        exit
+        foo:
+        exit
+        ",
+        config,
+        [],
+        (),
+        { |_vm, res: Result| res.unwrap() == ebpf::MM_STACK_START + config.stack_size() as u64 },
+        5
+    );
+}
+
+#[test]
+fn test_entrypoint_exit() {
+    // With fixed frames we used to exit the entrypoint when we reached an exit
+    // instruction and the stack size was 1 * config.stack_frame_size, which
+    // meant that we were in the entrypoint's frame.  With dynamic frames we
+    // can't infer anything from the stack size so we track call depth
+    // explicitly. Make sure exit still works with both fixed and dynamic
+    // frames.
+    for dynamic_stack_frames in [false, true] {
+        let config = Config {
+            dynamic_stack_frames,
+            ..Config::default()
+        };
+
+        // This checks that when foo exits we don't stop execution even if the
+        // stack is empty (stack size and call depth are decoupled)
+        test_interpreter_and_jit_asm!(
+            "
+            entrypoint:
+            call foo
+            mov r0, 42
+            exit
+            foo:
+            mov r0, 12
+            exit",
+            config,
+            [],
+            (),
+            { |_vm, res: Result| { res.unwrap() == 42 } },
+            5
+        );
+    }
+}
+
+#[test]
+fn test_stack_call_depth_tracking() {
+    for dynamic_stack_frames in [false, true] {
+        let config = Config {
+            dynamic_stack_frames,
+            max_call_depth: 2,
+            ..Config::default()
+        };
+
+        // Given max_call_depth=2, make sure that two sibling calls don't
+        // trigger CallDepthExceeded. In other words ensure that we correctly
+        // pop frames in the interpreter and decrement
+        // EnvironmentStackSlot::CallDepth on ebpf::EXIT in the jit.
+        test_interpreter_and_jit_asm!(
+            "
+            call foo
+            call foo
+            exit
+            foo:
+            exit
+            ",
+            config,
+            [],
+            (),
+            { |_vm, res: Result| { res.is_ok() } },
+            5
+        );
+
+        // two nested calls should trigger CallDepthExceeded instead
+        test_interpreter_and_jit_asm!(
+            "
+            entrypoint:
+            call foo
+            exit
+            foo:
+            call bar
+            exit
+            bar:
+            exit
+            ",
+            config,
+            [],
+            (),
+            {
+                |_vm, res: Result| {
+                    matches!(res.unwrap_err(),
+                        EbpfError::CallDepthExceeded(pc, depth)
+                        if pc == 29 + 2 && depth == config.max_call_depth
+                    )
+                }
+            },
+            2
+        );
+    }
+}
+
+#[test]
+fn test_err_mem_access_out_of_bound() {
+    let mem = [0; 512];
+    let mut prog = [0; 32];
+    prog[0] = ebpf::LD_DW_IMM;
+    prog[16] = ebpf::ST_B_IMM;
+    prog[24] = ebpf::EXIT;
+    for address in [0x2u64, 0x8002u64, 0x80000002u64, 0x8000000000000002u64] {
+        LittleEndian::write_u32(&mut prog[4..], address as u32);
+        LittleEndian::write_u32(&mut prog[12..], (address >> 32) as u32);
+        let config = Config::default();
+        let mut bpf_functions = BTreeMap::new();
+        let syscall_registry = SyscallRegistry::default();
+        register_bpf_function(
+            &config,
+            &mut bpf_functions,
+            &syscall_registry,
+            0,
+            "entrypoint",
+        )
+        .unwrap();
+        #[allow(unused_mut)]
+        let mut executable = Executable::<UserError, TestInstructionMeter>::from_text_bytes(
+            &prog,
+            None,
+            config,
+            syscall_registry,
+            bpf_functions,
+        )
+        .unwrap();
+        test_interpreter_and_jit!(
+            executable,
+            mem,
+            (),
+            {
+                |_vm, res: Result| {
+                    matches!(res.unwrap_err(),
+                        EbpfError::AccessViolation(pc, access_type, vm_addr, len, name)
+                        if access_type == AccessType::Store && pc == 31 && vm_addr == address && len == 1 && name == "unknown"
+                    )
+                }
+            },
+            2
+        );
+    }
 }
 
 // CALL_IMM & CALL_REG : Procedure Calls
@@ -2335,7 +2797,7 @@ fn test_call_reg() {
         mov64 r8, 0x1
         lsh64 r8, 0x20
         or64 r8, 0x30
-        callx 0x8
+        callx r8
         exit
         mov64 r0, 0x2A
         exit",
@@ -2351,7 +2813,7 @@ fn test_err_callx_oob_low() {
     test_interpreter_and_jit_asm!(
         "
         mov64 r0, 0x3
-        callx 0x0
+        callx r0
         exit",
         [],
         (),
@@ -2374,7 +2836,7 @@ fn test_err_callx_oob_high() {
         mov64 r0, -0x1
         lsh64 r0, 0x20
         or64 r0, 0x3
-        callx 0x0
+        callx r0
         exit",
         [],
         (),
@@ -2394,7 +2856,8 @@ fn test_err_callx_oob_high() {
 fn test_err_static_jmp_lddw() {
     test_interpreter_and_jit_asm!(
         "
-        ja 1
+        ja 2
+        mov r0, r0
         lddw r0, 0x1122334455667788
         exit
         ",
@@ -2403,7 +2866,7 @@ fn test_err_static_jmp_lddw() {
         {
             |_vm, res: Result| {
                 matches!(res.unwrap_err(),
-                    EbpfError::UnsupportedInstruction(pc) if pc == 31
+                    EbpfError::UnsupportedInstruction(pc) if pc == 32
                 )
             }
         },
@@ -2446,7 +2909,9 @@ fn test_err_static_jmp_lddw() {
     );
     test_interpreter_and_jit_asm!(
         "
-        call 1
+        call 3
+        mov r0, r0
+        mov r0, r0
         lddw r0, 0x1122334455667788
         exit
         ",
@@ -2455,7 +2920,7 @@ fn test_err_static_jmp_lddw() {
         {
             |_vm, res: Result| {
                 matches!(res.unwrap_err(),
-                    EbpfError::UnsupportedInstruction(pc) if pc == 31
+                    EbpfError::UnsupportedInstruction(pc) if pc == 33
                 )
             }
         },
@@ -2469,8 +2934,8 @@ fn test_err_dynamic_jmp_lddw() {
         "
         mov64 r8, 0x1
         lsh64 r8, 0x20
-        or64 r8, 40
-        callx 0x8
+        or64 r8, 0x28
+        callx r8
         lddw r0, 0x1122334455667788
         exit",
         [],
@@ -2483,6 +2948,49 @@ fn test_err_dynamic_jmp_lddw() {
             }
         },
         5
+    );
+    test_interpreter_and_jit_asm!(
+        "
+        mov64 r1, 0x1
+        lsh64 r1, 0x20
+        or64 r1, 0x38
+        callx r1
+        mov r0, r0
+        mov r0, r0
+        lddw r0, 0x1122334455667788
+        exit
+        ",
+        [],
+        (),
+        {
+            |_vm, res: Result| {
+                matches!(res.unwrap_err(),
+                    EbpfError::UnsupportedInstruction(pc) if pc == 36
+                )
+            }
+        },
+        5
+    );
+    test_interpreter_and_jit_asm!(
+        "
+        lddw r1, 0x100000038
+        callx r1
+        mov r0, r0
+        mov r0, r0
+        exit
+        lddw r0, 0x1122334455667788
+        exit
+        ",
+        [],
+        (),
+        {
+            |_vm, res: Result| {
+                matches!(res.unwrap_err(),
+                    EbpfError::UnsupportedInstruction(pc) if pc == 36
+                )
+            }
+        },
+        3
     );
 }
 
@@ -2530,7 +3038,7 @@ fn test_err_reg_stack_depth() {
         "
         mov64 r0, 0x1
         lsh64 r0, 0x20
-        callx 0x0
+        callx r0
         exit",
         [],
         (),
@@ -2720,7 +3228,7 @@ impl SyscallObject<UserError> for NestedVmSyscall {
             syscall_registry
                 .register_syscall_by_name::<UserError, _>(b"NestedVmSyscall", NestedVmSyscall::call)
                 .unwrap();
-            let mem = &mut [depth as u8 - 1, throw as u8];
+            let mem = [depth as u8 - 1, throw as u8];
             let mut executable = assemble::<UserError, TestInstructionMeter>(
                 "
                 ldabsb 0
@@ -2734,26 +3242,7 @@ impl SyscallObject<UserError> for NestedVmSyscall {
                 syscall_registry,
             )
             .unwrap();
-            #[cfg(all(not(windows), target_arch = "x86_64"))]
-            {
-                executable.jit_compile().unwrap();
-            }
-            let mut vm = EbpfVm::new(executable.as_ref(), &mut [], mem).unwrap();
-            vm.bind_syscall_context_object(Box::new(NestedVmSyscall {}), None)
-                .unwrap();
-            let mut instruction_meter = TestInstructionMeter { remaining: 6 };
-            #[cfg(any(windows, not(target_arch = "x86_64")))]
-            {
-                *result = vm.execute_program_interpreted(&mut instruction_meter);
-            }
-            #[cfg(all(not(windows), target_arch = "x86_64"))]
-            {
-                *result = vm.execute_program_jit(&mut instruction_meter);
-            }
-            assert_eq!(
-                vm.get_total_instruction_count(),
-                if throw == 0 { 6 } else { 5 }
-            );
+            test_interpreter_and_jit!(executable, mem, (b"NestedVmSyscall" => NestedVmSyscall::call; NestedVmSyscall {}), { |_vm, res: Result| { *result = res; true } }, if throw == 0 { 6 } else { 5 });
         } else {
             *result = if throw == 0 {
                 Ok(42)
@@ -2823,6 +3312,26 @@ fn test_load_elf_empty_rodata() {
 }
 
 #[test]
+fn test_load_elf_rodata() {
+    // checks that the program loads the correct rodata offset with both
+    // borrowed and owned rodata
+    for optimize_rodata in [false, true] {
+        let config = Config {
+            optimize_rodata,
+            ..Config::default()
+        };
+        test_interpreter_and_jit_elf!(
+            "tests/elfs/rodata.so",
+            config,
+            [],
+            (),
+            { |_vm, res: Result| { res.unwrap() == 42 } },
+            3
+        );
+    }
+}
+
+#[test]
 fn test_custom_entrypoint() {
     let mut file = File::open("tests/elfs/unresolved_syscall.so").expect("file open failed");
     let mut elf = Vec::new();
@@ -2836,7 +3345,7 @@ fn test_custom_entrypoint() {
     test_interpreter_and_jit!(register, syscall_registry, b"log" => syscalls::BpfSyscallString::call; syscalls::BpfSyscallString {});
     test_interpreter_and_jit!(register, syscall_registry, b"log_64" => syscalls::BpfSyscallU64::call; syscalls::BpfSyscallU64 {});
     #[allow(unused_mut)]
-    let mut executable = <dyn Executable<UserError, TestInstructionMeter>>::from_elf(
+    let mut executable = Executable::<UserError, TestInstructionMeter>::from_elf(
         &elf,
         None,
         config,
@@ -2927,7 +3436,7 @@ fn test_tight_infinite_recursion_callx() {
         lsh64 r8, 0x20
         or64 r8, 0x18
         mov64 r3, 0x41414141
-        callx 8
+        callx r8
         exit",
         [],
         (),
@@ -2985,6 +3494,29 @@ fn test_err_instruction_count_syscall_capped() {
 }
 
 #[test]
+fn test_err_instruction_count_lddw_capped() {
+    test_interpreter_and_jit_asm!(
+        "
+        mov r0, 0
+        lddw r1, 0x1
+        mov r2, 0
+        exit
+        ",
+        [],
+        (),
+        {
+            |_vm, res: Result| {
+                matches!(res.unwrap_err(),
+                    EbpfError::ExceededMaxInstructions(pc, initial_insn_count)
+                    if pc == 32 && initial_insn_count == 2
+                )
+            }
+        },
+        2
+    );
+}
+
+#[test]
 fn test_non_terminate_early() {
     test_interpreter_and_jit_asm!(
         "
@@ -3003,8 +3535,8 @@ fn test_non_terminate_early() {
         {
             |_vm, res: Result| {
                 matches!(res.unwrap_err(),
-                    EbpfError::ElfError(ElfError::UnresolvedSymbol(a, b, c))
-                    if a == "Unknown" && b == 35 && c == 48
+                    EbpfError::UnsupportedInstruction(pc)
+                    if pc == 35
                 )
             }
         },
@@ -3040,10 +3572,6 @@ fn test_err_non_terminate_capped() {
         },
         6
     );
-}
-
-#[test]
-fn test_err_non_terminating_capped() {
     test_interpreter_and_jit_asm!(
         "
         mov64 r6, 0x0
@@ -3095,7 +3623,6 @@ fn test_err_capped_before_exception() {
         },
         2
     );
-
     test_interpreter_and_jit_asm!(
         "
         mov64 r1, 0x0
@@ -3116,6 +3643,66 @@ fn test_err_capped_before_exception() {
             }
         },
         4
+    );
+}
+
+#[test]
+fn test_err_exit_capped() {
+    test_interpreter_and_jit_asm!(
+        "
+        mov64 r1, 0x1
+        lsh64 r1, 0x20
+        or64 r1, 0x20
+        callx r1
+        exit
+        ",
+        [],
+        (),
+        {
+            |_vm, res: Result| {
+                matches!(res.unwrap_err(),
+                    EbpfError::ExceededMaxInstructions(pc, initial_insn_count) if pc == 34 && initial_insn_count == 5
+                )
+            }
+        },
+        5
+    );
+    test_interpreter_and_jit_asm!(
+        "
+        mov64 r1, 0x1
+        lsh64 r1, 0x20
+        or64 r1, 0x20
+        callx r1
+        mov r0, r0
+        exit
+        ",
+        [],
+        (),
+        {
+            |_vm, res: Result| {
+                matches!(res.unwrap_err(),
+                    EbpfError::ExceededMaxInstructions(pc, initial_insn_count) if pc == 35 && initial_insn_count == 6
+                )
+            }
+        },
+        6
+    );
+    test_interpreter_and_jit_asm!(
+        "
+        call 0
+        mov r0, r0
+        exit
+        ",
+        [],
+        (),
+        {
+            |_vm, res: Result| {
+                matches!(res.unwrap_err(),
+                    EbpfError::ExceededMaxInstructions(pc, initial_insn_count) if pc == 32 && initial_insn_count == 3
+                )
+            }
+        },
+        3
     );
 }
 
@@ -3155,7 +3742,7 @@ fn test_err_call_unresolved() {
         [],
         (),
         {
-            |_vm, res: Result| matches!(res.unwrap_err(), EbpfError::ElfError(ElfError::UnresolvedSymbol(symbol, pc, offset)) if symbol == "Unknown" && pc == 34 && offset == 40)
+            |_vm, res: Result| matches!(res.unwrap_err(), EbpfError::UnsupportedInstruction(pc) if pc == 34)
         },
         6
     );
@@ -3169,11 +3756,11 @@ fn test_err_unresolved_elf() {
     let mut elf = Vec::new();
     file.read_to_end(&mut elf).unwrap();
     let config = Config {
-        reject_unresolved_syscalls: true,
+        reject_broken_elfs: true,
         ..Config::default()
     };
     assert!(
-        matches!(<dyn Executable::<UserError, TestInstructionMeter>>::from_elf(&elf, None, config, syscall_registry), Err(EbpfError::ElfError(ElfError::UnresolvedSymbol(symbol, pc, offset))) if symbol == "log_64" && pc == 550 && offset == 4168)
+        matches!(Executable::<UserError, TestInstructionMeter>::from_elf(&elf, None, config, syscall_registry), Err(EbpfError::ElfError(ElfError::UnresolvedSymbol(symbol, pc, offset))) if symbol == "log_64" && pc == 550 && offset == 4168)
     );
 }
 
@@ -3389,21 +3976,27 @@ fn test_tcp_sack_nomatch() {
 
 #[cfg(all(not(windows), target_arch = "x86_64"))]
 fn execute_generated_program(prog: &[u8]) -> bool {
-    use solana_rbpf::{elf::register_bpf_function, verifier::check};
-    use std::collections::BTreeMap;
-
     let max_instruction_count = 1024;
     let mem_size = 1024 * 1024;
     let mut bpf_functions = BTreeMap::new();
-    register_bpf_function(&mut bpf_functions, 0, "entrypoint").unwrap();
-    let executable = <dyn Executable<UserError, TestInstructionMeter>>::from_text_bytes(
+    let config = Config {
+        enable_instruction_tracing: true,
+        ..Config::default()
+    };
+    let syscall_registry = SyscallRegistry::default();
+    register_bpf_function(
+        &config,
+        &mut bpf_functions,
+        &syscall_registry,
+        0,
+        "entrypoint",
+    )
+    .unwrap();
+    let executable = Executable::<UserError, TestInstructionMeter>::from_text_bytes(
         prog,
-        Some(check),
-        Config {
-            enable_instruction_tracing: true,
-            ..Config::default()
-        },
-        SyscallRegistry::default(),
+        Some(solana_rbpf::verifier::check),
+        config,
+        syscall_registry,
         bpf_functions,
     );
     let mut executable = if let Ok(executable) = executable {
@@ -3411,12 +4004,12 @@ fn execute_generated_program(prog: &[u8]) -> bool {
     } else {
         return false;
     };
-    if executable.jit_compile().is_err() {
+    if Executable::<UserError, TestInstructionMeter>::jit_compile(&mut executable).is_err() {
         return false;
     }
     let (instruction_count_interpreter, tracer_interpreter, result_interpreter) = {
         let mut mem = vec![0u8; mem_size];
-        let mut vm = EbpfVm::new(executable.as_ref(), &mut [], &mut mem).unwrap();
+        let mut vm = EbpfVm::new(&executable, &mut [], &mut mem).unwrap();
         let result_interpreter = vm.execute_program_interpreted(&mut TestInstructionMeter {
             remaining: max_instruction_count,
         });
@@ -3428,7 +4021,7 @@ fn execute_generated_program(prog: &[u8]) -> bool {
         )
     };
     let mut mem = vec![0u8; mem_size];
-    let mut vm = EbpfVm::new(executable.as_ref(), &mut [], &mut mem).unwrap();
+    let mut vm = EbpfVm::new(&executable, &mut [], &mut mem).unwrap();
     let result_jit = vm.execute_program_jit(&mut TestInstructionMeter {
         remaining: max_instruction_count,
     });
@@ -3436,7 +4029,7 @@ fn execute_generated_program(prog: &[u8]) -> bool {
     if result_interpreter != result_jit
         || !solana_rbpf::vm::Tracer::compare(&tracer_interpreter, tracer_jit)
     {
-        let analysis = solana_rbpf::static_analysis::Analysis::from_executable(executable.as_ref());
+        let analysis = solana_rbpf::static_analysis::Analysis::from_executable(&executable);
         println!("result_interpreter={:?}", result_interpreter);
         println!("result_jit={:?}", result_jit);
         let stdout = std::io::stdout();
@@ -3456,7 +4049,6 @@ fn execute_generated_program(prog: &[u8]) -> bool {
 #[cfg(all(not(windows), target_arch = "x86_64"))]
 #[test]
 fn test_total_chaos() {
-    use solana_rbpf::ebpf;
     let instruction_count = 6;
     let iteration_count = 1000000;
     let mut program = vec![0; instruction_count * ebpf::INSN_SIZE];

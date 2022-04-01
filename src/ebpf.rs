@@ -1,3 +1,4 @@
+#![allow(clippy::integer_arithmetic)]
 // Copyright 2016 6WIND S.A. <quentin.monnet@6wind.com>
 //
 // Licensed under the Apache License, Version 2.0 <http://www.apache.org/licenses/LICENSE-2.0> or
@@ -21,12 +22,16 @@ use byteorder::{ByteOrder, LittleEndian};
 use hash32::{Hash, Hasher, Murmur3Hasher};
 use std::fmt;
 
+/// SBF version flag
+pub const EF_SBF_V2: u32 = 0x20;
 /// Maximum number of instructions in an eBPF program.
 pub const PROG_MAX_INSNS: usize = 65_536;
 /// Size of an eBPF instructions, in bytes.
 pub const INSN_SIZE: usize = 8;
-/// Stack register
-pub const STACK_REG: usize = 10;
+/// Frame pointer register
+pub const FRAME_PTR_REG: usize = 10;
+/// Stack pointer register
+pub const STACK_PTR_REG: usize = 11;
 /// First scratch register
 pub const FIRST_SCRATCH_REG: usize = 6;
 /// Number of scratch registers
@@ -145,6 +150,8 @@ pub const BPF_MOV: u8 = 0xb0;
 pub const BPF_ARSH: u8 = 0xc0;
 /// BPF ALU/ALU64 operation code: endianness conversion.
 pub const BPF_END: u8 = 0xd0;
+/// BPF ALU/ALU64 operation code: signed division.
+pub const BPF_SDIV: u8 = 0xe0;
 
 // Operation codes -- BPF_JMP class:
 /// BPF JMP operation code: jump.
@@ -283,6 +290,10 @@ pub const ARSH32_IMM: u8 = BPF_ALU | BPF_K | BPF_ARSH;
 ///
 /// <https://en.wikipedia.org/wiki/Arithmetic_shift>
 pub const ARSH32_REG: u8 = BPF_ALU | BPF_X | BPF_ARSH;
+/// BPF opcode: `sdiv32 dst, imm` /// `dst s/= imm`.
+pub const SDIV32_IMM: u8 = BPF_ALU | BPF_K | BPF_SDIV;
+/// BPF opcode: `sdiv32 dst, src` /// `dst s/= src`.
+pub const SDIV32_REG: u8 = BPF_ALU | BPF_X | BPF_SDIV;
 
 /// BPF opcode: `le dst` /// `dst = htole<imm>(dst), with imm in {16, 32, 64}`.
 pub const LE: u8 = BPF_ALU | BPF_K | BPF_END;
@@ -343,6 +354,10 @@ pub const ARSH64_IMM: u8 = BPF_ALU64 | BPF_K | BPF_ARSH;
 ///
 /// <https://en.wikipedia.org/wiki/Arithmetic_shift>
 pub const ARSH64_REG: u8 = BPF_ALU64 | BPF_X | BPF_ARSH;
+/// BPF opcode: `sdiv64 dst, imm` /// `dst s/= imm`.
+pub const SDIV64_IMM: u8 = BPF_ALU64 | BPF_K | BPF_SDIV;
+/// BPF opcode: `sdiv64 dst, src` /// `dst s/= src`.
+pub const SDIV64_REG: u8 = BPF_ALU64 | BPF_X | BPF_SDIV;
 
 /// BPF opcode: `ja +off` /// `PC += off`.
 pub const JA: u8 = BPF_JMP | BPF_JA;

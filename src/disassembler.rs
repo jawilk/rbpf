@@ -1,3 +1,4 @@
+#![allow(clippy::integer_arithmetic)]
 // Copyright 2017 6WIND S.A. <quentin.monnet@6wind.com>
 //
 // Licensed under the Apache License, Version 2.0 <http://www.apache.org/licenses/LICENSE-2.0> or
@@ -176,6 +177,8 @@ pub fn disassemble_instruction<E: UserDefinedError, I: InstructionMeter>(insn: &
         ebpf::MUL32_REG  => { name = "mul32";  desc = alu_reg_str(name, insn);  },
         ebpf::DIV32_IMM  => { name = "div32";  desc = alu_imm_str(name, insn);  },
         ebpf::DIV32_REG  => { name = "div32";  desc = alu_reg_str(name, insn);  },
+        ebpf::SDIV32_IMM => { name = "sdiv32"; desc = alu_imm_str(name, insn);  },
+        ebpf::SDIV32_REG => { name = "sdiv32"; desc = alu_reg_str(name, insn);  },
         ebpf::OR32_IMM   => { name = "or32";   desc = alu_imm_str(name, insn);  },
         ebpf::OR32_REG   => { name = "or32";   desc = alu_reg_str(name, insn);  },
         ebpf::AND32_IMM  => { name = "and32";  desc = alu_imm_str(name, insn);  },
@@ -205,6 +208,8 @@ pub fn disassemble_instruction<E: UserDefinedError, I: InstructionMeter>(insn: &
         ebpf::MUL64_REG  => { name = "mul64";  desc = alu_reg_str(name, insn); },
         ebpf::DIV64_IMM  => { name = "div64";  desc = alu_imm_str(name, insn); },
         ebpf::DIV64_REG  => { name = "div64";  desc = alu_reg_str(name, insn); },
+        ebpf::SDIV64_IMM => { name = "sdiv64"; desc = alu_imm_str(name, insn); },
+        ebpf::SDIV64_REG => { name = "sdiv64"; desc = alu_reg_str(name, insn); },
         ebpf::OR64_IMM   => { name = "or64";   desc = alu_imm_str(name, insn); },
         ebpf::OR64_REG   => { name = "or64";   desc = alu_reg_str(name, insn); },
         ebpf::AND64_IMM  => { name = "and64";  desc = alu_imm_str(name, insn); },
@@ -266,7 +271,7 @@ pub fn disassemble_instruction<E: UserDefinedError, I: InstructionMeter>(insn: &
                 }
             };
         },
-        ebpf::CALL_REG   => { name = "callx"; desc = format!("{} {}", name, insn.imm); },
+        ebpf::CALL_REG   => { name = "callx"; desc = format!("{} r{}", name, insn.imm); },
         ebpf::EXIT       => { name = "exit"; desc = name.to_string(); },
 
         _                => { name = "unknown"; desc = format!("{} opcode={:#x}", name, insn.opc); },

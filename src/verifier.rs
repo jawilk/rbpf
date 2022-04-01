@@ -1,3 +1,4 @@
+#![allow(clippy::integer_arithmetic)]
 // Derived from uBPF <https://github.com/iovisor/ubpf>
 // Copyright 2015 Big Switch Networks, Inc
 //      (uBPF: safety checks, originally in C)
@@ -108,7 +109,7 @@ fn check_imm_endian(insn: &ebpf::Insn, insn_ptr: usize) -> Result<(), VerifierEr
 }
 
 fn check_load_dw(prog: &[u8], insn_ptr: usize) -> Result<(), VerifierError> {
-    if insn_ptr + 1 >= (prog.len() / ebpf::INSN_SIZE) {
+    if (insn_ptr + 1) * ebpf::INSN_SIZE >= prog.len() {
         // Last instruction cannot be LD_DW because there would be no 2nd DW
         return Err(VerifierError::LDDWCannotBeLast);
     }
@@ -123,7 +124,7 @@ fn check_jmp_offset(prog: &[u8], insn_ptr: usize) -> Result<(), VerifierError> {
     let insn = ebpf::get_insn(prog, insn_ptr);
 
     let dst_insn_ptr = insn_ptr as isize + 1 + insn.off as isize;
-    if dst_insn_ptr < 0 || dst_insn_ptr as usize >= (prog.len() / ebpf::INSN_SIZE) {
+    if dst_insn_ptr < 0 || dst_insn_ptr as usize * ebpf::INSN_SIZE >= prog.len() {
         return Err(VerifierError::JumpOutOfCode(
             dst_insn_ptr as usize,
             adj_insn_ptr(insn_ptr),
@@ -139,12 +140,23 @@ fn check_jmp_offset(prog: &[u8], insn_ptr: usize) -> Result<(), VerifierError> {
     Ok(())
 }
 
-fn check_registers(insn: &ebpf::Insn, store: bool, insn_ptr: usize) -> Result<(), VerifierError> {
+fn check_registers(
+    insn: &ebpf::Insn,
+    store: bool,
+    insn_ptr: usize,
+    enable_stack_ptr: bool,
+) -> Result<(), VerifierError> {
     if insn.src > 10 {
         return Err(VerifierError::InvalidSourceRegister(adj_insn_ptr(insn_ptr)));
     }
+
     match (insn.dst, store) {
         (0..=9, _) | (10, true) => Ok(()),
+        (11, _)
+            if enable_stack_ptr && (insn.opc == ebpf::SUB64_IMM || insn.opc == ebpf::ADD64_IMM) =>
+        {
+            Ok(())
+        }
         (10, false) => Err(VerifierError::CannotWriteR10(adj_insn_ptr(insn_ptr))),
         (_, _) => Err(VerifierError::InvalidDestinationRegister(adj_insn_ptr(
             insn_ptr,
@@ -166,8 +178,12 @@ fn check_imm_shift(insn: &ebpf::Insn, insn_ptr: usize, imm_bits: u64) -> Result<
 }
 
 /// Check that the imm is a valid register number
-fn check_imm_register(insn: &ebpf::Insn, insn_ptr: usize) -> Result<(), VerifierError> {
-    if insn.imm < 0 || insn.imm > 10 {
+fn check_imm_register(
+    insn: &ebpf::Insn,
+    insn_ptr: usize,
+    config: &Config,
+) -> Result<(), VerifierError> {
+    if insn.imm < 0 || insn.imm > 10 || (insn.imm == 10 && config.reject_callx_r10) {
         return Err(VerifierError::InvalidRegister(adj_insn_ptr(insn_ptr)));
     }
     Ok(())
@@ -179,11 +195,21 @@ pub fn check(prog: &[u8], config: &Config) -> Result<(), VerifierError> {
     check_prog_len(prog)?;
 
     let mut insn_ptr: usize = 0;
-    while insn_ptr * ebpf::INSN_SIZE < prog.len() {
+    while (insn_ptr + 1) * ebpf::INSN_SIZE <= prog.len() {
         let insn = ebpf::get_insn(prog, insn_ptr);
         let mut store = false;
 
         match insn.opc {
+            ebpf::LD_ABS_B
+            | ebpf::LD_ABS_H
+            | ebpf::LD_ABS_W
+            | ebpf::LD_ABS_DW
+            | ebpf::LD_IND_B
+            | ebpf::LD_IND_H
+            | ebpf::LD_IND_W
+            | ebpf::LD_IND_DW if config.disable_deprecated_load_instructions => {
+                return Err(VerifierError::UnknownOpCode(insn.opc, adj_insn_ptr(insn_ptr)));
+            },
 
             // BPF_LD class
             ebpf::LD_ABS_B   => {},
@@ -227,13 +253,15 @@ pub fn check(prog: &[u8], config: &Config) -> Result<(), VerifierError> {
             ebpf::MUL32_REG  => {},
             ebpf::DIV32_IMM  => { check_imm_nonzero(&insn, insn_ptr)?; },
             ebpf::DIV32_REG  => {},
+            ebpf::SDIV32_IMM if config.enable_sdiv => { check_imm_nonzero(&insn, insn_ptr)?; },
+            ebpf::SDIV32_REG if config.enable_sdiv => {},
             ebpf::OR32_IMM   => {},
             ebpf::OR32_REG   => {},
             ebpf::AND32_IMM  => {},
             ebpf::AND32_REG  => {},
-            ebpf::LSH32_IMM  => { check_imm_shift(&insn, insn_ptr, if config.verify_shift32_imm { 32 } else { 64 })?; },
+            ebpf::LSH32_IMM  => { check_imm_shift(&insn, insn_ptr, 32)?; },
             ebpf::LSH32_REG  => {},
-            ebpf::RSH32_IMM  => { check_imm_shift(&insn, insn_ptr, if config.verify_shift32_imm { 32 } else { 64 })?; },
+            ebpf::RSH32_IMM  => { check_imm_shift(&insn, insn_ptr, 32)?; },
             ebpf::RSH32_REG  => {},
             ebpf::NEG32      => {},
             ebpf::MOD32_IMM  => { check_imm_nonzero(&insn, insn_ptr)?; },
@@ -242,7 +270,7 @@ pub fn check(prog: &[u8], config: &Config) -> Result<(), VerifierError> {
             ebpf::XOR32_REG  => {},
             ebpf::MOV32_IMM  => {},
             ebpf::MOV32_REG  => {},
-            ebpf::ARSH32_IMM => { check_imm_shift(&insn, insn_ptr, if config.verify_shift32_imm { 32 } else { 64 })?; },
+            ebpf::ARSH32_IMM => { check_imm_shift(&insn, insn_ptr, 32)?; },
             ebpf::ARSH32_REG => {},
             ebpf::LE         => { check_imm_endian(&insn, insn_ptr)?; },
             ebpf::BE         => { check_imm_endian(&insn, insn_ptr)?; },
@@ -252,14 +280,12 @@ pub fn check(prog: &[u8], config: &Config) -> Result<(), VerifierError> {
             ebpf::ADD64_REG  => {},
             ebpf::SUB64_IMM  => {},
             ebpf::SUB64_REG  => {},
-            ebpf::MUL64_IMM  => {
-                if config.verify_mul64_imm_nonzero {
-                    check_imm_nonzero(&insn, insn_ptr)?;
-                }
-            },
+            ebpf::MUL64_IMM  => {},
             ebpf::MUL64_REG  => {},
             ebpf::DIV64_IMM  => { check_imm_nonzero(&insn, insn_ptr)?; },
             ebpf::DIV64_REG  => {},
+            ebpf::SDIV64_IMM if config.enable_sdiv => { check_imm_nonzero(&insn, insn_ptr)?; },
+            ebpf::SDIV64_REG if config.enable_sdiv => {},
             ebpf::OR64_IMM   => {},
             ebpf::OR64_REG   => {},
             ebpf::AND64_IMM  => {},
@@ -303,7 +329,7 @@ pub fn check(prog: &[u8], config: &Config) -> Result<(), VerifierError> {
             ebpf::JSLE_IMM   => { check_jmp_offset(prog, insn_ptr)?; },
             ebpf::JSLE_REG   => { check_jmp_offset(prog, insn_ptr)?; },
             ebpf::CALL_IMM   => {},
-            ebpf::CALL_REG   => { check_imm_register(&insn, insn_ptr)?; },
+            ebpf::CALL_REG   => { check_imm_register(&insn, insn_ptr, config)?; },
             ebpf::EXIT       => {},
 
             _                => {
@@ -311,7 +337,7 @@ pub fn check(prog: &[u8], config: &Config) -> Result<(), VerifierError> {
             }
         }
 
-        check_registers(&insn, store, insn_ptr)?;
+        check_registers(&insn, store, insn_ptr, config.dynamic_stack_frames)?;
 
         insn_ptr += 1;
     }

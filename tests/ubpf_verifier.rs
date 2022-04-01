@@ -24,10 +24,12 @@ extern crate thiserror;
 
 use solana_rbpf::{
     assembler::assemble,
+    ebpf,
+    elf::Executable,
     error::UserDefinedError,
     user_error::UserError,
     verifier::{check, VerifierError},
-    vm::{Config, EbpfVm, Executable, SyscallRegistry, TestInstructionMeter},
+    vm::{Config, EbpfVm, SyscallRegistry, TestInstructionMeter},
 };
 use std::collections::BTreeMap;
 use thiserror::Error;
@@ -51,8 +53,8 @@ fn test_verifier_success() {
         SyscallRegistry::default(),
     )
     .unwrap();
-    let _vm = EbpfVm::<UserError, TestInstructionMeter>::new(executable.as_ref(), &mut [], &mut [])
-        .unwrap();
+    let _vm =
+        EbpfVm::<UserError, TestInstructionMeter>::new(&executable, &mut [], &mut []).unwrap();
 }
 
 #[test]
@@ -95,7 +97,7 @@ fn test_verifier_err_endian_size() {
         0xb7, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
         0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
     ];
-    let _ = <dyn Executable<UserError, TestInstructionMeter>>::from_text_bytes(
+    let _ = Executable::<UserError, TestInstructionMeter>::from_text_bytes(
         prog,
         Some(check),
         Config::default(),
@@ -113,7 +115,7 @@ fn test_verifier_err_incomplete_lddw() {
         0x18, 0x00, 0x00, 0x00, 0x88, 0x77, 0x66, 0x55, //
         0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
     ];
-    let _ = <dyn Executable<UserError, TestInstructionMeter>>::from_text_bytes(
+    let _ = Executable::<UserError, TestInstructionMeter>::from_text_bytes(
         prog,
         Some(check),
         Config::default(),
@@ -124,28 +126,64 @@ fn test_verifier_err_incomplete_lddw() {
 }
 
 #[test]
-#[should_panic(expected = "InvalidDestinationRegister(29)")]
 fn test_verifier_err_invalid_reg_dst() {
-    let _executable = assemble::<UserError, TestInstructionMeter>(
-        "
-        mov r11, 1
-        exit",
-        Some(check),
-        Config::default(),
-        SyscallRegistry::default(),
-    )
-    .unwrap();
+    // r11 is disabled when dynamic_stack_frames=false, and only sub and add are
+    // allowed when dynamic_stack_frames=true
+    for dynamic_stack_frames in [false, true] {
+        assert_eq!(
+            assemble::<UserError, TestInstructionMeter>(
+                "
+                mov r11, 1
+                exit",
+                Some(check),
+                Config {
+                    dynamic_stack_frames,
+                    ..Config::default()
+                },
+                SyscallRegistry::default(),
+            )
+            .unwrap_err(),
+            "Executable constructor VerifierError(InvalidDestinationRegister(29))"
+        );
+    }
 }
 
 #[test]
-#[should_panic(expected = "InvalidSourceRegister(29)")]
 fn test_verifier_err_invalid_reg_src() {
+    // r11 is disabled when dynamic_stack_frames=false, and only sub and add are
+    // allowed when dynamic_stack_frames=true
+    for dynamic_stack_frames in [false, true] {
+        assert_eq!(
+            assemble::<UserError, TestInstructionMeter>(
+                "
+                mov r0, r11
+                exit",
+                Some(check),
+                Config {
+                    dynamic_stack_frames,
+                    ..Config::default()
+                },
+                SyscallRegistry::default(),
+            )
+            .unwrap_err(),
+            "Executable constructor VerifierError(InvalidSourceRegister(29))"
+        );
+    }
+}
+
+#[test]
+fn test_verifier_resize_stack_ptr_success() {
     let _executable = assemble::<UserError, TestInstructionMeter>(
         "
-        mov r0, r11
+        sub r11, 1
+        add r11, 1
         exit",
         Some(check),
-        Config::default(),
+        Config {
+            dynamic_stack_frames: true,
+            enable_stack_frame_gaps: false,
+            ..Config::default()
+        },
         SyscallRegistry::default(),
     )
     .unwrap();
@@ -187,7 +225,7 @@ fn test_verifier_err_unknown_opcode() {
         0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
         0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
     ];
-    let _ = <dyn Executable<UserError, TestInstructionMeter>>::from_text_bytes(
+    let _ = Executable::<UserError, TestInstructionMeter>::from_text_bytes(
         prog,
         Some(check),
         Config::default(),
@@ -242,10 +280,7 @@ fn test_verifier_err_all_shift_overflows() {
         let result = assemble::<UserError, TestInstructionMeter>(
             &assembly,
             Some(check),
-            Config {
-                verify_shift32_imm: true,
-                ..Config::default()
-            },
+            Config::default(),
             SyscallRegistry::default(),
         );
         match expected {
@@ -257,6 +292,86 @@ fn test_verifier_err_all_shift_overflows() {
                 ),
                 _ => panic!("Expected error"),
             },
+        }
+    }
+}
+
+#[test]
+fn test_verifier_err_ldabs_ldind_disabled() {
+    let instructions = [
+        (ebpf::LD_ABS_B, "ldabsb 0x3"),
+        (ebpf::LD_ABS_H, "ldabsh 0x3"),
+        (ebpf::LD_ABS_W, "ldabsw 0x3"),
+        (ebpf::LD_ABS_DW, "ldabsdw 0x3"),
+        (ebpf::LD_IND_B, "ldindb r1, 0x3"),
+        (ebpf::LD_IND_H, "ldindh r1, 0x3"),
+        (ebpf::LD_IND_W, "ldindw r1, 0x3"),
+        (ebpf::LD_IND_DW, "ldinddw r1, 0x3"),
+    ];
+
+    for (opc, instruction) in instructions {
+        for disable_deprecated_load_instructions in [true, false] {
+            let assembly = format!("\n{}\nexit", instruction);
+            let result = assemble::<UserError, TestInstructionMeter>(
+                &assembly,
+                Some(check),
+                Config {
+                    disable_deprecated_load_instructions,
+                    ..Config::default()
+                },
+                SyscallRegistry::default(),
+            );
+
+            if disable_deprecated_load_instructions {
+                assert_eq!(
+                    result.unwrap_err(),
+                    format!(
+                        "Executable constructor VerifierError(UnknownOpCode({}, {}))",
+                        opc,
+                        ebpf::ELF_INSN_DUMP_OFFSET
+                    ),
+                );
+            } else {
+                assert!(result.is_ok());
+            }
+        }
+    }
+}
+
+#[test]
+fn test_sdiv_disabled() {
+    let instructions = [
+        (ebpf::SDIV32_IMM, "sdiv32 r0, 2"),
+        (ebpf::SDIV32_REG, "sdiv32 r0, r1"),
+        (ebpf::SDIV64_IMM, "sdiv64 r0, 4"),
+        (ebpf::SDIV64_REG, "sdiv64 r0, r1"),
+    ];
+
+    for (opc, instruction) in instructions {
+        for enable_sdiv in [true, false] {
+            let assembly = format!("\n{}\nexit", instruction);
+            let result = assemble::<UserError, TestInstructionMeter>(
+                &assembly,
+                Some(check),
+                Config {
+                    enable_sdiv,
+                    ..Config::default()
+                },
+                SyscallRegistry::default(),
+            );
+
+            if enable_sdiv {
+                assert!(result.is_ok());
+            } else {
+                assert_eq!(
+                    result.unwrap_err(),
+                    format!(
+                        "Executable constructor VerifierError(UnknownOpCode({}, {}))",
+                        opc,
+                        ebpf::ELF_INSN_DUMP_OFFSET
+                    ),
+                );
+            }
         }
     }
 }

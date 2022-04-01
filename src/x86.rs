@@ -1,3 +1,4 @@
+#![allow(clippy::integer_arithmetic)]
 use crate::{
     error::{EbpfError, UserDefinedError},
     jit::{emit, emit_variable_length, JitCompiler, OperandSize},
@@ -182,18 +183,27 @@ impl X86Instruction {
     }
 
     /// Swap source and destination
-    pub fn xchg(size: OperandSize, source: u8, destination: u8) -> Self {
+    pub fn xchg(
+        size: OperandSize,
+        source: u8,
+        destination: u8,
+        indirect: Option<X86IndirectAccess>,
+    ) -> Self {
+        debug_assert_eq!(size, OperandSize::S64);
         Self {
             size,
             opcode: 0x87,
             first_operand: source,
             second_operand: destination,
+            indirect,
             ..Self::default()
         }
     }
 
     /// Swap byte order of destination
     pub fn bswap(size: OperandSize, destination: u8) -> Self {
+        debug_assert_ne!(size, OperandSize::S0);
+        debug_assert_ne!(size, OperandSize::S8);
         match size {
             OperandSize::S16 => Self {
                 size,
@@ -232,9 +242,10 @@ impl X86Instruction {
         destination: u8,
         indirect: Option<X86IndirectAccess>,
     ) -> Self {
+        debug_assert_ne!(size, OperandSize::S0);
         Self {
             size,
-            opcode: 0x85,
+            opcode: if size == OperandSize::S8 { 0x84 } else { 0x85 },
             first_operand: source,
             second_operand: destination,
             indirect,
@@ -249,12 +260,17 @@ impl X86Instruction {
         immediate: i64,
         indirect: Option<X86IndirectAccess>,
     ) -> Self {
+        debug_assert_ne!(size, OperandSize::S0);
         Self {
             size,
-            opcode: 0xf7,
+            opcode: if size == OperandSize::S8 { 0xf6 } else { 0xf7 },
             first_operand: RAX,
             second_operand: destination,
-            immediate_size: OperandSize::S32,
+            immediate_size: if size != OperandSize::S64 {
+                size
+            } else {
+                OperandSize::S32
+            },
             immediate,
             indirect,
             ..Self::default()
@@ -268,9 +284,10 @@ impl X86Instruction {
         destination: u8,
         indirect: Option<X86IndirectAccess>,
     ) -> Self {
+        debug_assert_ne!(size, OperandSize::S0);
         Self {
             size,
-            opcode: 0x39,
+            opcode: if size == OperandSize::S8 { 0x38 } else { 0x39 },
             first_operand: source,
             second_operand: destination,
             indirect,
@@ -285,12 +302,17 @@ impl X86Instruction {
         immediate: i64,
         indirect: Option<X86IndirectAccess>,
     ) -> Self {
+        debug_assert_ne!(size, OperandSize::S0);
         Self {
             size,
-            opcode: 0x81,
+            opcode: if size == OperandSize::S8 { 0x80 } else { 0x81 },
             first_operand: RDI,
             second_operand: destination,
-            immediate_size: OperandSize::S32,
+            immediate_size: if size != OperandSize::S64 {
+                size
+            } else {
+                OperandSize::S32
+            },
             immediate,
             indirect,
             ..Self::default()
@@ -304,6 +326,7 @@ impl X86Instruction {
         destination: u8,
         indirect: Option<X86IndirectAccess>,
     ) -> Self {
+        debug_assert_eq!(size, OperandSize::S64);
         Self {
             size,
             opcode: 0x8d,
@@ -321,6 +344,7 @@ impl X86Instruction {
         destination: u8,
         indirect: X86IndirectAccess,
     ) -> Self {
+        debug_assert_ne!(size, OperandSize::S0);
         Self {
             size: if size == OperandSize::S64 {
                 OperandSize::S64
@@ -351,6 +375,7 @@ impl X86Instruction {
         destination: u8,
         indirect: X86IndirectAccess,
     ) -> Self {
+        debug_assert_ne!(size, OperandSize::S0);
         Self {
             size,
             opcode: match size {
@@ -366,6 +391,9 @@ impl X86Instruction {
 
     /// Load destination from sign-extended immediate
     pub fn load_immediate(size: OperandSize, destination: u8, immediate: i64) -> Self {
+        debug_assert_ne!(size, OperandSize::S0);
+        debug_assert_ne!(size, OperandSize::S8);
+        debug_assert_ne!(size, OperandSize::S16);
         let immediate_size =
             if immediate >= std::i32::MIN as i64 && immediate <= std::i32::MAX as i64 {
                 OperandSize::S32
@@ -401,6 +429,7 @@ impl X86Instruction {
         indirect: X86IndirectAccess,
         immediate: i64,
     ) -> Self {
+        debug_assert_ne!(size, OperandSize::S0);
         Self {
             size,
             opcode: match size {
@@ -420,13 +449,47 @@ impl X86Instruction {
     }
 
     /// Push source onto the stack
-    pub fn push(source: u8) -> Self {
+    #[allow(dead_code)]
+    pub fn push_immediate(size: OperandSize, immediate: i32) -> Self {
+        debug_assert_ne!(size, OperandSize::S0);
+        debug_assert_ne!(size, OperandSize::S16);
         Self {
-            size: OperandSize::S32,
-            opcode: 0x50 | (source & 0b111),
+            size,
+            opcode: match size {
+                OperandSize::S8 => 0x6A,
+                _ => 0x68,
+            },
             modrm: false,
-            second_operand: source,
+            immediate_size: if size == OperandSize::S64 {
+                OperandSize::S32
+            } else {
+                size
+            },
+            immediate: immediate as i64,
             ..Self::default()
+        }
+    }
+
+    /// Push source onto the stack
+    pub fn push(source: u8, indirect: Option<X86IndirectAccess>) -> Self {
+        if indirect.is_none() {
+            Self {
+                size: OperandSize::S32,
+                opcode: 0x50 | (source & 0b111),
+                modrm: false,
+                second_operand: source,
+                ..Self::default()
+            }
+        } else {
+            Self {
+                size: OperandSize::S64,
+                opcode: 0xFF,
+                modrm: true,
+                first_operand: 6,
+                second_operand: source,
+                indirect,
+                ..Self::default()
+            }
         }
     }
 
@@ -442,13 +505,9 @@ impl X86Instruction {
     }
 
     /// Push RIP and jump to destination
-    pub fn call_reg(
-        size: OperandSize,
-        destination: u8,
-        indirect: Option<X86IndirectAccess>,
-    ) -> Self {
+    pub fn call_reg(destination: u8, indirect: Option<X86IndirectAccess>) -> Self {
         Self {
-            size,
+            size: OperandSize::S64,
             opcode: 0xff,
             first_operand: 2,
             second_operand: destination,
@@ -501,7 +560,6 @@ impl X86Instruction {
     }
 
     /// rdtsc
-    #[allow(dead_code)]
     pub fn cycle_count() -> Self {
         Self {
             size: OperandSize::S32,

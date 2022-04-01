@@ -18,14 +18,18 @@ use solana_rbpf::{
 macro_rules! disasm {
     ($src:expr) => {{
         let src = $src;
+        let config = Config {
+            enable_symbol_and_section_labels: true,
+            ..Config::default()
+        };
         let executable = assemble::<UserError, TestInstructionMeter>(
             src,
             None,
-            Config::default(),
+            config,
             SyscallRegistry::default(),
         )
         .unwrap();
-        let analysis = Analysis::from_executable(executable.as_ref());
+        let analysis = Analysis::from_executable(&executable);
         let mut reasm = Vec::new();
         analysis.disassemble(&mut reasm).unwrap();
         assert_eq!(src, String::from_utf8(reasm).unwrap());

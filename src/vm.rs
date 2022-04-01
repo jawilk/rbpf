@@ -1,3 +1,4 @@
+#![allow(clippy::integer_arithmetic)]
 // Derived from uBPF <https://github.com/iovisor/ubpf>
 // Copyright 2015 Big Switch Networks, Inc
 //      (uBPF: VM architecture, parts of the interpreter, originally in C)
@@ -11,13 +12,14 @@
 //! Virtual machine and JIT compiler for eBPF programs.
 
 use crate::disassembler::disassemble_instruction;
+use crate::ebpf::STACK_PTR_REG;
 use crate::static_analysis::Analysis;
 use crate::{
     call_frames::CallFrames,
     ebpf,
-    elf::EBpfElf,
+    elf::Executable,
     error::{EbpfError, UserDefinedError},
-    jit::{JitProgram, JitProgramArgument},
+    jit::JitProgramArgument,
     memory_region::{AccessType, MemoryMapping, MemoryRegion},
     user_error::UserError,
     verifier::VerifierError,
@@ -26,6 +28,8 @@ use log::debug;
 use std::{
     collections::{BTreeMap, HashMap},
     fmt::Debug,
+    mem,
+    pin::Pin,
     u32,
 };
 
@@ -170,6 +174,13 @@ impl SyscallRegistry {
     pub fn get_number_of_syscalls(&self) -> usize {
         self.entries.len()
     }
+
+    /// Calculate memory size
+    pub fn mem_size(&self) -> usize {
+        mem::size_of::<Self>()
+            + self.entries.capacity() * mem::size_of::<(u32, Syscall)>()
+            + self.context_object_slots.capacity() * mem::size_of::<(u64, usize)>()
+    }
 }
 
 /// VM configuration settings
@@ -187,19 +198,39 @@ pub struct Config {
     pub enable_instruction_meter: bool,
     /// Enable instruction tracing
     pub enable_instruction_tracing: bool,
-    /// Reject ELF files containing syscalls which are not in the SyscallRegistry
-    pub reject_unresolved_syscalls: bool,
+    /// Enable dynamic string allocation for labels
+    pub enable_symbol_and_section_labels: bool,
+    /// Disable reporting of unresolved symbols at runtime
+    pub disable_unresolved_symbols_at_runtime: bool,
+    /// Reject ELF files containing issues that the verifier did not catch before (up to v0.2.21)
+    pub reject_broken_elfs: bool,
     /// Ratio of random no-ops per instruction in JIT (0.0 = OFF)
     pub noop_instruction_ratio: f64,
     /// Enable disinfection of immediate values and offsets provided by the user in JIT
     pub sanitize_user_provided_values: bool,
     /// Encrypt the environment registers in JIT
     pub encrypt_environment_registers: bool,
-    /// Feature flag for the MUL64_IMM != 0 verification check
-    pub verify_mul64_imm_nonzero: bool,
-    /// Feature flag for the SHIFT_IMM >= 32 verification check
-    pub verify_shift32_imm: bool,
+    /// Disable ldabs* and ldind* instructions
+    pub disable_deprecated_load_instructions: bool,
+    /// Throw ElfError::SymbolHashCollision when a BPF function collides with a registered syscall
+    pub syscall_bpf_function_hash_collision: bool,
+    /// Have the verifier reject "callx r10"
+    pub reject_callx_r10: bool,
+    /// Use dynamic stack frame sizes
+    pub dynamic_stack_frames: bool,
+    /// Enable native signed division
+    pub enable_sdiv: bool,
+    /// Avoid copying read only sections when possible
+    pub optimize_rodata: bool,
 }
+
+impl Config {
+    /// Returns the size of the stack memory region
+    pub fn stack_size(&self) -> usize {
+        self.stack_frame_size * self.max_call_depth
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -209,87 +240,57 @@ impl Default for Config {
             instruction_meter_checkpoint_distance: 10000,
             enable_instruction_meter: true,
             enable_instruction_tracing: false,
-            reject_unresolved_syscalls: false,
+            enable_symbol_and_section_labels: false,
+            disable_unresolved_symbols_at_runtime: true,
+            reject_broken_elfs: false,
             noop_instruction_ratio: 1.0 / 256.0,
             sanitize_user_provided_values: true,
             encrypt_environment_registers: true,
-            verify_mul64_imm_nonzero: false,
-            verify_shift32_imm: false,
+            disable_deprecated_load_instructions: true,
+            syscall_bpf_function_hash_collision: true,
+            reject_callx_r10: true,
+            dynamic_stack_frames: false,
+            enable_sdiv: true,
+            optimize_rodata: true,
         }
     }
 }
-
-/// An relocated and ready to execute binary
-pub trait Executable<E: UserDefinedError, I: InstructionMeter>: Send + Sync {
-    /// Get the configuration settings
-    fn get_config(&self) -> &Config;
-    /// Get the .text section virtual address and bytes
-    fn get_text_bytes(&self) -> (u64, &[u8]);
-    /// Get the concatenated read-only sections (including the text section)
-    fn get_ro_section(&self) -> &[u8];
-    /// Get the entry point offset into the text section
-    fn get_entrypoint_instruction_offset(&self) -> Result<usize, EbpfError<E>>;
-    /// Get a symbol's instruction offset
-    fn lookup_bpf_function(&self, hash: u32) -> Option<usize>;
-    /// Get the syscall registry
-    fn get_syscall_registry(&self) -> &SyscallRegistry;
-    /// Get the JIT compiled program
-    fn get_compiled_program(&self) -> Option<&JitProgram<E, I>>;
-    /// JIT compile the executable
-    fn jit_compile(&mut self) -> Result<(), EbpfError<E>>;
-    /// Report information on a symbol that failed to be resolved
-    fn report_unresolved_symbol(&self, insn_offset: usize) -> Result<u64, EbpfError<E>>;
-    /// Get BPF functions
-    fn get_function_symbols(&self) -> BTreeMap<usize, (u32, String)>;
-    /// Get syscalls symbols
-    fn get_syscall_symbols(&self) -> &BTreeMap<u32, String>;
-}
-
-#[cfg(vtable_send_sync_plus_one)]
-/// Index of report_unresolved_symbol in the Executable traits vtable
-///
-/// It is shifted by 1 because Send + Sync needs an extra slot.
-pub const REPORT_UNRESOLVED_SYMBOL_INDEX: usize = 9;
-#[cfg(not(vtable_send_sync_plus_one))]
-/// Index of report_unresolved_symbol in the Executable traits vtable
-pub const REPORT_UNRESOLVED_SYMBOL_INDEX: usize = 8;
 
 /// The syscall_context_objects field stores some metadata in the front, thus the entries are shifted
 pub const SYSCALL_CONTEXT_OBJECTS_OFFSET: usize = 4;
 
 /// Static constructors for Executable
-impl<E: UserDefinedError, I: 'static + InstructionMeter> dyn Executable<E, I> {
-    /// Creates a post relocaiton/fixup executable from an ELF file
+impl<E: UserDefinedError, I: 'static + InstructionMeter> Executable<E, I> {
+    /// Creates a verified executable from an ELF file
     pub fn from_elf(
         elf_bytes: &[u8],
         verifier: Option<Verifier>,
         config: Config,
         syscall_registry: SyscallRegistry,
-    ) -> Result<Box<Self>, EbpfError<E>> {
-        let ebpf_elf = EBpfElf::load(config, elf_bytes, syscall_registry)?;
-        let text_bytes = ebpf_elf.get_text_bytes().1;
+    ) -> Result<Pin<Box<Self>>, EbpfError<E>> {
+        let executable = Executable::load(config, elf_bytes, syscall_registry)?;
         if let Some(verifier) = verifier {
-            verifier(text_bytes, &config)?;
+            verifier(executable.get_text_bytes().1, executable.get_config())?;
         }
-        Ok(Box::new(ebpf_elf))
+        Ok(Pin::new(Box::new(executable)))
     }
-    /// Creates a post relocaiton/fixup executable from machine code
+    /// Creates a verified executable from machine code
     pub fn from_text_bytes(
         text_bytes: &[u8],
         verifier: Option<Verifier>,
         config: Config,
         syscall_registry: SyscallRegistry,
         bpf_functions: BTreeMap<u32, (usize, String)>,
-    ) -> Result<Box<Self>, EbpfError<E>> {
+    ) -> Result<Pin<Box<Self>>, EbpfError<E>> {
         if let Some(verifier) = verifier {
             verifier(text_bytes, &config).map_err(EbpfError::VerifierError)?;
         }
-        Ok(Box::new(EBpfElf::new_from_text_bytes(
+        Ok(Pin::new(Box::new(Executable::new_from_text_bytes(
             config,
             text_bytes,
             syscall_registry,
             bpf_functions,
-        )))
+        ))))
     }
 }
 
@@ -453,7 +454,7 @@ macro_rules! translate_memory_access {
 /// # Examples
 ///
 /// ```
-/// use solana_rbpf::{ebpf, elf::register_bpf_function, vm::{Config, Executable, EbpfVm, TestInstructionMeter, SyscallRegistry}, user_error::UserError};
+/// use solana_rbpf::{ebpf, elf::{Executable, register_bpf_function}, vm::{Config, EbpfVm, TestInstructionMeter, SyscallRegistry}, user_error::UserError};
 ///
 /// let prog = &[
 ///     0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00  // exit
@@ -463,17 +464,19 @@ macro_rules! translate_memory_access {
 /// ];
 ///
 /// // Instantiate a VM.
+/// let config = Config::default();
 /// let mut bpf_functions = std::collections::BTreeMap::new();
-/// register_bpf_function(&mut bpf_functions, 0, "entrypoint").unwrap();
-/// let mut executable = <dyn Executable::<UserError, TestInstructionMeter>>::from_text_bytes(prog, None, Config::default(), SyscallRegistry::default(), bpf_functions).unwrap();
-/// let mut vm = EbpfVm::<UserError, TestInstructionMeter>::new(executable.as_ref(), &mut [], mem).unwrap();
+/// let syscall_registry = SyscallRegistry::default();
+/// register_bpf_function(&config, &mut bpf_functions, &syscall_registry, 0, "entrypoint").unwrap();
+/// let mut executable = Executable::<UserError, TestInstructionMeter>::from_text_bytes(prog, None, config, syscall_registry, bpf_functions).unwrap();
+/// let mut vm = EbpfVm::<UserError, TestInstructionMeter>::new(&executable, &mut [], mem).unwrap();
 ///
 /// // Provide a reference to the packet data.
 /// let res = vm.execute_program_interpreted(&mut TestInstructionMeter { remaining: 1 }).unwrap();
 /// assert_eq!(res, 0);
 /// ```
 pub struct EbpfVm<'a, E: UserDefinedError, I: InstructionMeter> {
-    executable: &'a dyn Executable<E, I>,
+    executable: &'a Executable<E, I>,
     program: &'a [u8],
     program_vm_addr: u64,
     memory_mapping: MemoryMapping<'a>,
@@ -492,29 +495,30 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, E, I> {
     /// # Examples
     ///
     /// ```
-    /// use solana_rbpf::{ebpf, elf::register_bpf_function, vm::{Config, Executable, EbpfVm, TestInstructionMeter, SyscallRegistry}, user_error::UserError};
+    /// use solana_rbpf::{ebpf, elf::{Executable, register_bpf_function}, vm::{Config, EbpfVm, TestInstructionMeter, SyscallRegistry}, user_error::UserError};
     ///
     /// let prog = &[
     ///     0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00  // exit
     /// ];
     ///
     /// // Instantiate a VM.
+    /// let config = Config::default();
     /// let mut bpf_functions = std::collections::BTreeMap::new();
-    /// register_bpf_function(&mut bpf_functions, 0, "entrypoint").unwrap();
-    /// let mut executable = <dyn Executable::<UserError, TestInstructionMeter>>::from_text_bytes(prog, None, Config::default(), SyscallRegistry::default(), bpf_functions).unwrap();
-    /// let mut vm = EbpfVm::<UserError, TestInstructionMeter>::new(executable.as_ref(), &mut [], &mut []).unwrap();
+    /// let syscall_registry = SyscallRegistry::default();
+    /// register_bpf_function(&config, &mut bpf_functions, &syscall_registry, 0, "entrypoint").unwrap();
+    /// let mut executable = Executable::<UserError, TestInstructionMeter>::from_text_bytes(prog, None, config, syscall_registry, bpf_functions).unwrap();
+    /// let mut vm = EbpfVm::<UserError, TestInstructionMeter>::new(&executable, &mut [], &mut []).unwrap();
     /// ```
     pub fn new(
-        executable: &'a dyn Executable<E, I>,
+        executable: &'a Pin<Box<Executable<E, I>>>,
         heap_region: &mut [u8],
         input_region: &mut [u8],
     ) -> Result<EbpfVm<'a, E, I>, EbpfError<E>> {
         let config = executable.get_config();
-        let ro_region = executable.get_ro_section();
         let stack = CallFrames::new(config);
         let regions: Vec<MemoryRegion> = vec![
             MemoryRegion::new_from_slice(&[], 0, 0, false),
-            MemoryRegion::new_from_slice(ro_region, ebpf::MM_PROGRAM_START, 0, false),
+            executable.get_ro_region(),
             stack.get_memory_region(),
             MemoryRegion::new_from_slice(heap_region, ebpf::MM_HEAP_START, 0, true),
             MemoryRegion::new_from_slice(input_region, ebpf::MM_INPUT_START, 0, true),
@@ -566,7 +570,7 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, E, I> {
     /// # Examples
     ///
     /// ```
-    /// use solana_rbpf::{ebpf, elf::register_bpf_function, vm::{Config, Executable, EbpfVm, SyscallObject, SyscallRegistry, TestInstructionMeter}, syscalls::BpfTracePrintf, user_error::UserError};
+    /// use solana_rbpf::{ebpf, elf::{Executable, register_bpf_function}, vm::{Config, EbpfVm, SyscallObject, SyscallRegistry, TestInstructionMeter}, syscalls::BpfTracePrintf, user_error::UserError};
     ///
     /// // This program was compiled with clang, from a C program containing the following single
     /// // instruction: `return bpf_trace_printk("foo %c %c %c\n", 10, 1, 2, 3);`
@@ -589,10 +593,11 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, E, I> {
     /// let mut syscall_registry = SyscallRegistry::default();
     /// syscall_registry.register_syscall_by_hash(6, BpfTracePrintf::call).unwrap();
     /// // Instantiate an Executable and VM
+    /// let config = Config::default();
     /// let mut bpf_functions = std::collections::BTreeMap::new();
-    /// register_bpf_function(&mut bpf_functions, 0, "entrypoint").unwrap();
-    /// let mut executable = <dyn Executable::<UserError, TestInstructionMeter>>::from_text_bytes(prog, None, Config::default(), syscall_registry, bpf_functions).unwrap();
-    /// let mut vm = EbpfVm::<UserError, TestInstructionMeter>::new(executable.as_ref(), &mut [], &mut []).unwrap();
+    /// register_bpf_function(&config, &mut bpf_functions, &syscall_registry, 0, "entrypoint").unwrap();
+    /// let mut executable = Executable::<UserError, TestInstructionMeter>::from_text_bytes(prog, None, config, syscall_registry, bpf_functions).unwrap();
+    /// let mut vm = EbpfVm::<UserError, TestInstructionMeter>::new(&executable, &mut [], &mut []).unwrap();
     /// // Bind a context object instance to the previously registered syscall
     /// vm.bind_syscall_context_object(Box::new(BpfTracePrintf {}), None);
     /// ```
@@ -643,7 +648,7 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, E, I> {
     /// # Examples
     ///
     /// ```
-    /// use solana_rbpf::{ebpf, elf::register_bpf_function, vm::{Config, Executable, EbpfVm, TestInstructionMeter, SyscallRegistry}, user_error::UserError};
+    /// use solana_rbpf::{ebpf, elf::{Executable, register_bpf_function}, vm::{Config, EbpfVm, TestInstructionMeter, SyscallRegistry}, user_error::UserError};
     ///
     /// let prog = &[
     ///     0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00  // exit
@@ -653,10 +658,12 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, E, I> {
     /// ];
     ///
     /// // Instantiate a VM.
+    /// let config = Config::default();
     /// let mut bpf_functions = std::collections::BTreeMap::new();
-    /// register_bpf_function(&mut bpf_functions, 0, "entrypoint").unwrap();
-    /// let mut executable = <dyn Executable::<UserError, TestInstructionMeter>>::from_text_bytes(prog, None, Config::default(), SyscallRegistry::default(), bpf_functions).unwrap();
-    /// let mut vm = EbpfVm::<UserError, TestInstructionMeter>::new(executable.as_ref(), &mut [], mem).unwrap();
+    /// let syscall_registry = SyscallRegistry::default();
+    /// register_bpf_function(&config, &mut bpf_functions, &syscall_registry, 0, "entrypoint").unwrap();
+    /// let mut executable = Executable::<UserError, TestInstructionMeter>::from_text_bytes(prog, None, config, syscall_registry, bpf_functions).unwrap();
+    /// let mut vm = EbpfVm::<UserError, TestInstructionMeter>::new(&executable, &mut [], mem).unwrap();
     ///
     /// // Provide a reference to the packet data.
     /// let res = vm.execute_program_interpreted(&mut TestInstructionMeter { remaining: 1 }).unwrap();
@@ -684,7 +691,7 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, E, I> {
         const U32MAX: u64 = u32::MAX as u64;
 
         // R1 points to beginning of input memory, R10 to the stack of the first frame
-        let mut reg: [u64; 11] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, self.stack.get_stack_top()];
+        let mut reg: [u64; 11] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, self.stack.get_frame_ptr()];
 
         if self.memory_mapping.map::<UserError>(AccessType::Store, ebpf::MM_INPUT_START, 1).is_ok() {
             reg[1] = ebpf::MM_INPUT_START;
@@ -693,6 +700,7 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, E, I> {
         // Check config outside of the instruction loop
         let instruction_meter_enabled = self.executable.get_config().enable_instruction_meter;
         let instruction_tracing_enabled = self.executable.get_config().enable_instruction_tracing;
+        let dynamic_stack_frames = self.executable.get_config().dynamic_stack_frames;
 
         // Loop on instructions
         let entry = self.executable.get_entrypoint_instruction_offset()?;
@@ -701,9 +709,10 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, E, I> {
         let initial_insn_count = remaining_insn_count;
         self.last_insn_count = 0;
         let mut total_insn_count = 0;
-        while next_pc * ebpf::INSN_SIZE + ebpf::INSN_SIZE <= self.program.len() {
+        while (next_pc + 1) * ebpf::INSN_SIZE <= self.program.len() {
             let pc = next_pc;
             next_pc += 1;
+            let mut instruction_width = 1;
             let mut insn = ebpf::get_insn_unchecked(self.program, pc);
             let dst = insn.dst as usize;
             let src = insn.src as usize;
@@ -716,7 +725,18 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, E, I> {
                 self.tracer.trace(state);
             }
 
+
             match insn.opc {
+                _ if dst == STACK_PTR_REG && dynamic_stack_frames => {
+                    match insn.opc {
+                        ebpf::SUB64_IMM => self.stack.resize_stack(-insn.imm),
+                        ebpf::ADD64_IMM => self.stack.resize_stack(insn.imm),
+                        _ => {
+                            #[cfg(debug_assertions)]
+                            unreachable!("unexpected insn on r11")
+                        }
+                    }
+                }
 
                 // BPF_LD class
                 // Since this pointer is constant, and since we already know it (ebpf::MM_INPUT_START), do not
@@ -764,6 +784,7 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, E, I> {
 
                 ebpf::LD_DW_IMM  => {
                     ebpf::augment_lddw_unchecked(self.program, &mut insn);
+                    instruction_width = 2;
                     next_pc += 1;
                     reg[dst] = insn.imm as u64;
                 },
@@ -846,7 +867,22 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, E, I> {
                     if reg[src] as u32 == 0 {
                         return Err(EbpfError::DivideByZero(pc + ebpf::ELF_INSN_DUMP_OFFSET));
                     }
-                                    reg[dst] = (reg[dst] as u32 / reg[src] as u32)               as u64;
+                    reg[dst] = (reg[dst] as u32 / reg[src] as u32) as u64;
+                },
+                ebpf::SDIV32_IMM  => {
+                    if reg[dst] as i32 == i32::MIN && insn.imm == -1 {
+                        return Err(EbpfError::DivideOverflow(pc + ebpf::ELF_INSN_DUMP_OFFSET));
+                    }
+                    reg[dst] = (reg[dst] as i32 / insn.imm as i32) as u64;
+                }
+                ebpf::SDIV32_REG  => {
+                    if reg[src] as i32 == 0 {
+                        return Err(EbpfError::DivideByZero(pc + ebpf::ELF_INSN_DUMP_OFFSET));
+                    }
+                    if reg[dst] as i32 == i32::MIN && reg[src] as i32 == -1 {
+                        return Err(EbpfError::DivideOverflow(pc + ebpf::ELF_INSN_DUMP_OFFSET));
+                    }
+                    reg[dst] = (reg[dst] as i32 / reg[src] as i32) as u64;
                 },
                 ebpf::OR32_IMM   =>   reg[dst] = (reg[dst] as u32             | insn.imm as u32) as u64,
                 ebpf::OR32_REG   =>   reg[dst] = (reg[dst] as u32             | reg[src] as u32) as u64,
@@ -905,6 +941,22 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, E, I> {
                     }
                                     reg[dst] /= reg[src];
                 },
+                ebpf::SDIV64_IMM  => {
+                    if reg[dst] as i64 == i64::MIN && insn.imm == -1 {
+                        return Err(EbpfError::DivideOverflow(pc + ebpf::ELF_INSN_DUMP_OFFSET));
+                    }
+
+                    reg[dst] = (reg[dst] as i64 / insn.imm) as u64
+                }
+                ebpf::SDIV64_REG  => {
+                    if reg[src] == 0 {
+                        return Err(EbpfError::DivideByZero(pc + ebpf::ELF_INSN_DUMP_OFFSET));
+                    }
+                    if reg[dst] as i64 == i64::MIN && reg[src] as i64 == -1 {
+                        return Err(EbpfError::DivideOverflow(pc + ebpf::ELF_INSN_DUMP_OFFSET));
+                    }
+                    reg[dst] = (reg[dst] as i64 / reg[src] as i64) as u64;
+                },
                 ebpf::OR64_IMM   => reg[dst] |=  insn.imm as u64,
                 ebpf::OR64_REG   => reg[dst] |=  reg[src],
                 ebpf::AND64_IMM  => reg[dst] &=  insn.imm as u64,
@@ -955,7 +1007,7 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, E, I> {
 
                 ebpf::CALL_REG   => {
                     let target_address = reg[insn.imm as usize];
-                    reg[ebpf::STACK_REG] =
+                    reg[ebpf::FRAME_PTR_REG] =
                         self.stack.push(&reg[ebpf::FIRST_SCRATCH_REG..ebpf::FIRST_SCRATCH_REG + ebpf::SCRATCH_REGS], next_pc)?;
                     if target_address < self.program_vm_addr {
                         return Err(EbpfError::CallOutsideTextSegment(pc + ebpf::ELF_INSN_DUMP_OFFSET, target_address / ebpf::INSN_SIZE as u64 * ebpf::INSN_SIZE as u64));
@@ -989,12 +1041,11 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, E, I> {
                         }
                     } else if let Some(target_pc) = self.executable.lookup_bpf_function(insn.imm as u32) {
                         // make BPF to BPF call
-                        reg[ebpf::STACK_REG] = self.stack.push(
-                            &reg[ebpf::FIRST_SCRATCH_REG
-                                ..ebpf::FIRST_SCRATCH_REG + ebpf::SCRATCH_REGS],
-                            next_pc,
-                        )?;
+                        reg[ebpf::FRAME_PTR_REG] =
+                            self.stack.push(&reg[ebpf::FIRST_SCRATCH_REG..ebpf::FIRST_SCRATCH_REG + ebpf::SCRATCH_REGS], next_pc)?;
                         next_pc = self.check_pc(pc, target_pc)?;
+                    } else if self.executable.get_config().disable_unresolved_symbols_at_runtime {
+                        return Err(EbpfError::UnsupportedInstruction(pc + ebpf::ELF_INSN_DUMP_OFFSET));
                     } else {
                         self.executable.report_unresolved_symbol(pc)?;
                     }
@@ -1002,12 +1053,12 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, E, I> {
 
                 ebpf::EXIT => {
                     match self.stack.pop::<E>() {
-                        Ok((saved_reg, stack_ptr, ptr)) => {
+                        Ok((saved_reg, frame_ptr, ptr)) => {
                             // Return from BPF to BPF call
                             reg[ebpf::FIRST_SCRATCH_REG
                                 ..ebpf::FIRST_SCRATCH_REG + ebpf::SCRATCH_REGS]
                                 .copy_from_slice(&saved_reg);
-                            reg[ebpf::STACK_REG] = stack_ptr;
+                            reg[ebpf::FRAME_PTR_REG] = frame_ptr;
                             next_pc = self.check_pc(pc, ptr)?;
                         }
                         _ => {
@@ -1022,8 +1073,10 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, E, I> {
                 }
                 _ => return Err(EbpfError::UnsupportedInstruction(pc + ebpf::ELF_INSN_DUMP_OFFSET)),
             }
+
             if instruction_meter_enabled && self.last_insn_count >= remaining_insn_count {
-                return Err(EbpfError::ExceededMaxInstructions(pc + 1 + ebpf::ELF_INSN_DUMP_OFFSET, initial_insn_count));
+                // Use `pc + instruction_width` instead of `next_pc` here because jumps and calls don't continue at the end of this instruction
+                return Err(EbpfError::ExceededMaxInstructions(pc + instruction_width + ebpf::ELF_INSN_DUMP_OFFSET, initial_insn_count));
             }
         }
 
