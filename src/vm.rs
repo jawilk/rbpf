@@ -31,6 +31,48 @@ use std::{
     u32,
 };
 
+// ----------------- DEBUGGER -----------------
+use crate::gdb_stub::{start_debug_server, BpfRegs, VmReply, VmRequest};
+use std::sync::mpsc;
+
+struct DebugConfig {
+    tx: mpsc::SyncSender<VmReply>,
+    rx: mpsc::Receiver<VmRequest>,
+    breakpoints: Vec<u64>,
+    block: bool,
+    state: DebugState,
+    text_section_offset: u64,
+}
+
+impl DebugConfig {
+    fn new(use_debug: bool, program_vm_addr: u64) -> Option<DebugConfig> {
+        if use_debug {
+            let (tx, rx) = start_debug_server(9001);
+            let text_section_offset = program_vm_addr.saturating_sub(ebpf::MM_PROGRAM_START);
+            Some(DebugConfig {
+                tx,
+                rx,
+                breakpoints: Vec::new(),
+                block: true,
+                state: DebugState::Normal,
+                text_section_offset,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub enum DebugState {
+    Normal,
+    Step,
+    Continue,
+    Terminating,
+    Exited,
+}
+// --------------------------------------------
+
 /// eBPF verification function that returns an error if the program does not meet its requirements.
 ///
 /// Some examples of things the verifier may reject the program for:
@@ -610,6 +652,111 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, E, I> {
             .map(|slot| self.syscall_context_objects[SYSCALL_CONTEXT_OBJECTS_OFFSET + slot])
     }
 
+    // ----------------- DEBUGGER -----------------
+    fn handle_dbg_request(
+        &mut self,
+        debug_config: &mut DebugConfig,
+        regs: &mut [u64; 11],
+        pc: usize,
+    ) -> Result<(), EbpfError<E>> {
+        let action = if let Ok(request) = debug_config.rx.recv() {
+            request
+        } else {
+            eprintln!("debugger detatched from VM");
+            debug_config.block = false;
+            return Ok(());
+        };
+        match action {
+            VmRequest::Continue => {
+                debug_config.block = false;
+                debug_config.state = DebugState::Continue;
+            }
+            VmRequest::Step => {
+                match debug_config.state {
+                    DebugState::Terminating => {
+                        debug_config.state = DebugState::Exited;
+                        debug_config
+                            .tx
+                            .send(VmReply::Halted(regs[0] as u8))
+                            .unwrap();
+                    }
+                    _ => debug_config.tx.send(VmReply::DoneStep).unwrap(),
+                };
+                debug_config.block = false;
+                debug_config.state = DebugState::Step;
+            }
+            VmRequest::ReadMem(start_addr, len) => {
+                let mut start_addr_adjusted = start_addr;
+                // No need to make gdb use full 64-bit pc, transform back to vm pc
+                if start_addr < ebpf::MM_PROGRAM_START {
+                    start_addr_adjusted += ebpf::MM_PROGRAM_START;
+                }
+                let host_ptr =
+                    translate_memory_access!(self, start_addr_adjusted, AccessType::Load, pc, u8);
+                let read_mem = unsafe { std::slice::from_raw_parts(host_ptr, len as usize) };
+                debug_config.tx.send(VmReply::ReadMem(read_mem)).unwrap();
+                return Ok(());
+            }
+            VmRequest::ReadRegs => {
+                debug_config
+                    .tx
+                    .send(VmReply::ReadRegs(BpfRegs {
+                        regs: *regs,
+                        pc: ((pc * 8) as u64) + debug_config.text_section_offset,
+                    }))
+                    .unwrap();
+            }
+            VmRequest::WriteReg(reg_id, value) => {
+                regs[reg_id as usize] = value;
+                debug_config.tx.send(VmReply::WriteReg).unwrap();
+            }
+            VmRequest::SetBrkpt(addr) => {
+                debug_config.breakpoints.push(addr);
+                debug_config.tx.send(VmReply::SetBrkpt).unwrap();
+            }
+            VmRequest::RemoveBrkpt(addr) => {
+                match debug_config.breakpoints.iter().position(|x| *x == addr) {
+                    None => println!("Breakpoint not found"),
+                    Some(pos) => {
+                        debug_config.breakpoints.remove(pos);
+                        debug_config.tx.send(VmReply::RemoveBrkpt).unwrap();
+                    }
+                }
+            }
+            _ => {
+                debug_config.tx.send(VmReply::Err("unimplemented")).unwrap();
+            }
+        };
+        Ok(())
+    }
+
+    fn check_for_dbg_request(
+        &mut self,
+        debug_config: &mut DebugConfig,
+        reg: &mut [u64; 11],
+        pc: usize,
+    ) -> Result<(), EbpfError<E>> {
+        if debug_config.state == DebugState::Step {
+            debug_config.block = true;
+            debug_config.state = DebugState::Normal;
+        }
+        while debug_config.block {
+            self.handle_dbg_request(debug_config, reg, pc);
+        }
+        if debug_config
+            .breakpoints
+            .contains(&(((pc * 8) as u64) + debug_config.text_section_offset))
+        {
+            debug_config.tx.send(VmReply::Breakpoint).unwrap();
+            if debug_config.state == DebugState::Continue {
+                debug_config.block = true;
+            }
+            self.handle_dbg_request(debug_config, reg, pc);
+        }
+        Ok(())
+    }
+    // ------------------------------------------
+
     /// Execute the program loaded, with the given packet data.
     ///
     /// Warning: The program is executed without limiting the number of
@@ -637,13 +784,17 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, E, I> {
     /// let res = vm.execute_program_interpreted(&mut TestInstructionMeter { remaining: 1 }).unwrap();
     /// assert_eq!(res, 0);
     /// ```
-    pub fn execute_program_interpreted(&mut self, instruction_meter: &mut I) -> ProgramResult<E> {
+    pub fn execute_program_interpreted(
+        &mut self,
+        instruction_meter: &mut I,
+        use_debug: bool,
+    ) -> ProgramResult<E> {
         let initial_insn_count = if self.executable.get_config().enable_instruction_meter {
             instruction_meter.get_remaining()
         } else {
             0
         };
-        let result = self.execute_program_interpreted_inner(instruction_meter);
+        let result = self.execute_program_interpreted_inner(instruction_meter, use_debug);
         if self.executable.get_config().enable_instruction_meter {
             instruction_meter.consume(self.last_insn_count);
             self.total_insn_count = initial_insn_count - instruction_meter.get_remaining();
@@ -655,6 +806,7 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, E, I> {
     fn execute_program_interpreted_inner(
         &mut self,
         instruction_meter: &mut I,
+	    use_debug: bool,
     ) -> ProgramResult<E> {
         const U32MAX: u64 = u32::MAX as u64;
 
@@ -676,6 +828,11 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, E, I> {
         let initial_insn_count = remaining_insn_count;
         self.last_insn_count = 0;
         let mut total_insn_count = 0;
+
+	    // ---------- DEBUGGER -------------
+        let mut debug_config = DebugConfig::new(use_debug, self.program_vm_addr);
+        // ---------------------------------
+
         while (next_pc + 1) * ebpf::INSN_SIZE <= self.program.len() {
             let pc = next_pc;
             next_pc += 1;
@@ -683,6 +840,12 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, E, I> {
             let dst = insn.dst as usize;
             let src = insn.src as usize;
             self.last_insn_count += 1;
+
+	    // ---------- DEBUGGER -------------
+            if use_debug {
+                self.check_for_dbg_request(&mut debug_config.as_mut().unwrap(), &mut reg, pc).unwrap();
+    	    }
+            // ---------------------------------
 
             if instruction_tracing_enabled {
                 let mut state = [0u64; 12];
@@ -991,6 +1154,16 @@ impl<'a, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, E, I> {
                                 "Max frame depth reached: {:?}",
                                 self.stack.get_max_frame_index()
                             );
+
+			// --------------------- DEBUGGER ------------------
+			if use_debug {
+				if debug_config.as_ref().unwrap().state == DebugState::Continue { debug_config.as_ref().unwrap().tx.send(VmReply::Halted(reg[0] as u8)).unwrap(); }
+				debug_config.as_mut().unwrap().state = DebugState::Terminating;
+				debug_config.as_mut().unwrap().block = true; 
+				self.check_for_dbg_request(debug_config.as_mut().unwrap(), &mut reg, pc).unwrap();
+			}
+			// ----------------------------------------------------
+
                             return Ok(reg[0]);
                         }
                     }
