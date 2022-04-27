@@ -19,8 +19,7 @@ use solana_rbpf::{
     ebpf,
     elf::{register_bpf_function, ElfError, Executable},
     error::EbpfError,
-    memory_region::AccessType,
-    memory_region::MemoryMapping,
+    memory_region::{AccessType, MemoryMapping, MemoryRegion},
     syscalls::{self, Result},
     user_error::UserError,
     vm::{Config, EbpfVm, SyscallObject, SyscallRegistry, TestInstructionMeter},
@@ -40,7 +39,8 @@ macro_rules! test_interpreter_and_jit {
         let mut check_closure = $check;
         let (instruction_count_interpreter, _tracer_interpreter) = {
             let mut mem = $mem;
-            let mut vm = EbpfVm::new(&$executable, &mut [], &mut mem).unwrap();
+            let mem_region = MemoryRegion::new_writable(&mut mem, ebpf::MM_INPUT_START);
+            let mut vm = EbpfVm::new(&$executable, &mut [], vec![mem_region]).unwrap();
             $(test_interpreter_and_jit!(bind, vm, $location => $syscall_function; $syscall_context_object);)*
             let result = vm.execute_program_interpreted(&mut TestInstructionMeter { remaining: $expected_instruction_count });
             assert!(check_closure(&vm, result));
@@ -52,15 +52,20 @@ macro_rules! test_interpreter_and_jit {
             let mut check_closure = $check;
             let compilation_result = Executable::<UserError, TestInstructionMeter>::jit_compile(&mut $executable);
             let mut mem = $mem;
-            let mut vm = EbpfVm::new(&$executable, &mut [], &mut mem).unwrap();
+            let mem_region = MemoryRegion::new_writable(&mut mem, ebpf::MM_INPUT_START);
+            let mut vm = EbpfVm::new(&$executable, &mut [], vec![mem_region]).unwrap();
             match compilation_result {
                 Err(err) => assert!(check_closure(&vm, Err(err))),
                 Ok(()) => {
                     $(test_interpreter_and_jit!(bind, vm, $location => $syscall_function; $syscall_context_object);)*
                     let result = vm.execute_program_jit(&mut TestInstructionMeter { remaining: $expected_instruction_count });
                     let tracer_jit = vm.get_tracer();
-                    if !check_closure(&vm, result) || !solana_rbpf::vm::Tracer::compare(&_tracer_interpreter, tracer_jit) {
-                        let analysis = solana_rbpf::static_analysis::Analysis::from_executable(&$executable);
+                    if !check_closure(&vm, result)
+                        || !solana_rbpf::vm::Tracer::compare(&_tracer_interpreter, tracer_jit)
+                    {
+                        let analysis =
+                            solana_rbpf::static_analysis::Analysis::from_executable(&$executable)
+                                .unwrap();
                         let stdout = std::io::stdout();
                         _tracer_interpreter.write(&mut stdout.lock(), &analysis).unwrap();
                         tracer_jit.write(&mut stdout.lock(), &analysis).unwrap();
@@ -4009,7 +4014,8 @@ fn execute_generated_program(prog: &[u8]) -> bool {
     }
     let (instruction_count_interpreter, tracer_interpreter, result_interpreter) = {
         let mut mem = vec![0u8; mem_size];
-        let mut vm = EbpfVm::new(&executable, &mut [], &mut mem).unwrap();
+        let mem_region = MemoryRegion::new_writable(&mut mem, ebpf::MM_INPUT_START);
+        let mut vm = EbpfVm::new(&executable, &mut [], vec![mem_region]).unwrap();
         let result_interpreter = vm.execute_program_interpreted(&mut TestInstructionMeter {
             remaining: max_instruction_count,
         });
@@ -4021,7 +4027,8 @@ fn execute_generated_program(prog: &[u8]) -> bool {
         )
     };
     let mut mem = vec![0u8; mem_size];
-    let mut vm = EbpfVm::new(&executable, &mut [], &mut mem).unwrap();
+    let mem_region = MemoryRegion::new_writable(&mut mem, ebpf::MM_INPUT_START);
+    let mut vm = EbpfVm::new(&executable, &mut [], vec![mem_region]).unwrap();
     let result_jit = vm.execute_program_jit(&mut TestInstructionMeter {
         remaining: max_instruction_count,
     });
@@ -4029,7 +4036,8 @@ fn execute_generated_program(prog: &[u8]) -> bool {
     if result_interpreter != result_jit
         || !solana_rbpf::vm::Tracer::compare(&tracer_interpreter, tracer_jit)
     {
-        let analysis = solana_rbpf::static_analysis::Analysis::from_executable(&executable);
+        let analysis =
+            solana_rbpf::static_analysis::Analysis::from_executable(&executable).unwrap();
         println!("result_interpreter={:?}", result_interpreter);
         println!("result_jit={:?}", result_jit);
         let stdout = std::io::stdout();

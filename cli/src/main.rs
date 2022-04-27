@@ -1,8 +1,9 @@
 use clap::{crate_version, App, Arg};
 use solana_rbpf::{
     assembler::assemble,
+    ebpf,
     elf::Executable,
-    memory_region::MemoryMapping,
+    memory_region::{MemoryMapping, MemoryRegion},
     static_analysis::Analysis,
     syscalls::Result,
     user_error::UserError,
@@ -11,6 +12,7 @@ use solana_rbpf::{
 };
 use std::{fs::File, io::Read, path::Path};
 
+#[derive(Clone)]
 struct MockSyscall {
     name: String,
 }
@@ -178,14 +180,15 @@ fn main() {
     if matches.value_of("use") == Some("jit") {
         Executable::<UserError, TestInstructionMeter>::jit_compile(&mut executable).unwrap();
     }
-    let mut vm = EbpfVm::new(&executable, &mut mem, &mut heap).unwrap();
+    let mem_region = MemoryRegion::new_writable(&mut mem, ebpf::MM_INPUT_START);
+    let mut vm = EbpfVm::new(&executable, &mut heap, vec![mem_region]).unwrap();
 
     let analysis = if matches.value_of("use") == Some("cfg")
         || matches.value_of("use") == Some("disassembler")
         || matches.is_present("trace")
         || matches.is_present("profile")
     {
-        Some(Analysis::from_executable(&executable))
+        Some(Analysis::from_executable(&executable).unwrap())
     } else {
         None
     };
@@ -231,7 +234,7 @@ fn main() {
     }
     if matches.is_present("profile") {
         let tracer = &vm.get_tracer();
-        let dynamic_analysis = DynamicAnalysis::new(&tracer, analysis.as_ref().unwrap());
+        let dynamic_analysis = DynamicAnalysis::new(tracer, analysis.as_ref().unwrap());
         let mut file = File::create("profile.dot").unwrap();
         analysis
             .as_ref()
