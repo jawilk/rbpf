@@ -328,6 +328,12 @@ impl<E: UserDefinedError, I: InstructionMeter> Executable<E, I> {
         self.bpf_functions.get(&hash).map(|(pc, _name)| *pc)
     }
 
+    /// Get the text section offset
+    #[cfg(feature = "debugger")]
+    pub fn get_text_section_offset(&self) -> u64 {
+        self.text_section_info.offset_range.start as u64
+    }
+
     /// Get the syscall registry
     pub fn get_syscall_registry(&self) -> &SyscallRegistry {
         &self.syscall_registry
