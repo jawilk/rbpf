@@ -34,8 +34,8 @@ use crate::{
 
 type DynResult<T> = Result<T, Box<dyn std::error::Error>>;
 
-fn wait_for_tcp(port: u16) -> DynResult<TcpStream> {
-    let sockaddr = format!("127.0.0.1:{}", port);
+fn wait_for_tcp(host: &str, port: u16) -> DynResult<TcpStream> {
+    let sockaddr = format!("{}:{}", host, port);
     eprintln!("Waiting for a Debugger connection on {:?}...", sockaddr);
 
     let sock = TcpListener::bind(sockaddr)?;
@@ -48,10 +48,11 @@ fn wait_for_tcp(port: u16) -> DynResult<TcpStream> {
 /// Connect to the debugger and hand over the control of the interpreter
 pub fn execute<V: Verifier, E: UserDefinedError, I: InstructionMeter>(
     interpreter: &mut Interpreter<V, E, I>,
+    host: &str,
     port: u16,
 ) -> ProgramResult<E> {
     let connection: Box<dyn ConnectionExt<Error = std::io::Error>> =
-        Box::new(wait_for_tcp(port).expect("Cannot connect to Debugger"));
+        Box::new(wait_for_tcp(host, port).expect("Cannot connect to Debugger"));
 
     let mut dbg = GdbStub::new(connection)
         .run_state_machine(interpreter)
@@ -59,7 +60,6 @@ pub fn execute<V: Verifier, E: UserDefinedError, I: InstructionMeter>(
     loop {
         dbg = match dbg {
             state_machine::GdbStubStateMachine::Idle(mut dbg_inner) => {
-                //loop {}
                 let byte = dbg_inner.borrow_conn().read().unwrap();
                 dbg_inner.incoming_data(interpreter, byte).unwrap()
             }
