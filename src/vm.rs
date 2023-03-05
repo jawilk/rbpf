@@ -481,7 +481,7 @@ pub struct EbpfVm<'a, V: Verifier, E: UserDefinedError, I: InstructionMeter> {
     pub(crate) syscall_context_objects: Vec<*mut u8>,
     syscall_context_object_pool: Vec<Box<dyn SyscallObject<E> + 'a>>,
     pub(crate) stack: CallFrames<'a>,
-    total_insn_count: u64,
+    pub(crate) total_insn_count: u64,
 }
 
 impl<'a, V: Verifier, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, V, E, I> {
