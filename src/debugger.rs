@@ -54,7 +54,7 @@ fn wait_for_tcp(host: &str, port: u16) -> DynResult<TcpStream> {
                 return Ok(stream);
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                if now.elapsed().as_secs() > 10 {
+                if now.elapsed().as_secs() > 25 {
                     println!("Error accepting connection (timeout): {:?}", e);
                     return Err(e.into());
                 }
@@ -125,6 +125,7 @@ pub fn execute<V: Verifier, E: UserDefinedError, I: InstructionMeter>(
                         }
                     }
                 };
+                // TODO handle error here (ie run till end, will break conection if we receive a broken package (on exit etc))
                 dbg_inner.incoming_data(interpreter, byte).unwrap()
             }
 
