@@ -54,7 +54,7 @@ fn wait_for_tcp(host: &str, port: u16) -> DynResult<TcpStream> {
                 return Ok(stream);
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                if now.elapsed().as_secs() > 25 {
+                if now.elapsed().as_secs() > 10 {
                     println!("Error accepting connection (timeout): {:?}", e);
                     return Err(e.into());
                 }
@@ -64,10 +64,36 @@ fn wait_for_tcp(host: &str, port: u16) -> DynResult<TcpStream> {
             Err(e) => panic!("encountered IO error: {}", e),
         }
     }
-    //let (stream, addr) = sock.accept()?;
-    //eprintln!("Debugger connected from {}", addr);
+}
 
-    //Ok(stream)
+fn finish_execution<V: Verifier, E: UserDefinedError, I: InstructionMeter>(
+    interpreter: &mut Interpreter<V, E, I>,
+    result: Option<Option<u64>>,
+) -> ProgramResult<E> {
+    let res = match result {
+        Some(res) => res,
+        None => loop {
+            match interpreter.step() {
+                Ok(None) => (),
+                Ok(result) => break result,
+                Err(e) => return Err(e),
+            }
+        },
+    };
+    if interpreter
+        .vm
+        .verified_executable
+        .get_executable()
+        .get_config()
+        .enable_instruction_meter
+    {
+        interpreter
+            .instruction_meter
+            .consume(interpreter.due_insn_count);
+        interpreter.vm.total_insn_count =
+            interpreter.initial_insn_count - interpreter.instruction_meter.get_remaining();
+    }
+    return Ok(res.unwrap_or(0));
 }
 
 /// Connect to the debugger and hand over the control of the interpreter
@@ -79,33 +105,8 @@ pub fn execute<V: Verifier, E: UserDefinedError, I: InstructionMeter>(
     let connection: Box<dyn ConnectionExt<Error = std::io::Error>> = match wait_for_tcp(host, port)
     {
         Ok(stream) => Box::new(stream),
-        Err(_) => {
-            let result = loop {
-                match interpreter.step() {
-                    Ok(None) => (),
-                    Ok(result) => break result,
-                    Err(e) => return Err(e),
-                }
-            };
-            if interpreter
-                .vm
-                .verified_executable
-                .get_executable()
-                .get_config()
-                .enable_instruction_meter
-            {
-                interpreter
-                    .instruction_meter
-                    .consume(interpreter.due_insn_count);
-                interpreter.vm.total_insn_count =
-                    interpreter.initial_insn_count - interpreter.instruction_meter.get_remaining();
-            }
-
-            return Ok(result.unwrap_or(0));
-        }
+        Err(_) => return finish_execution(interpreter, None),
     };
-    //::new(wait_for_tcp(host, port).expect("Cannot connect to Debugger"));
-
     let mut dbg = GdbStub::new(connection)
         .run_state_machine(interpreter)
         .expect("Cannot start debugging state machine");
@@ -116,28 +117,18 @@ pub fn execute<V: Verifier, E: UserDefinedError, I: InstructionMeter>(
                     Ok(byte) => byte,
                     Err(_) => {
                         eprintln!("Connection error, running till end");
-                        loop {
-                            match interpreter.step() {
-                                Ok(None) => (),
-                                Ok(result) => break 'outer result,
-                                Err(e) => return Err(e),
-                            }
-                        }
+                        return finish_execution(interpreter, None);
                     }
                 };
-                // TODO handle error here (ie run till end, will break conection if we receive a broken package (on exit etc))
-                dbg_inner.incoming_data(interpreter, byte).unwrap()
+                match dbg_inner.incoming_data(interpreter, byte) {
+                    Ok(dbg) => dbg,
+                    _ => return finish_execution(interpreter, None),
+                }
             }
 
             state_machine::GdbStubStateMachine::Disconnected(_dbg_inner) => {
                 eprintln!("Client disconnected, running till end");
-                loop {
-                    match interpreter.step() {
-                        Ok(None) => (),
-                        Ok(result) => break 'outer result,
-                        Err(e) => return Err(e),
-                    }
-                }
+                return finish_execution(interpreter, None);
             }
 
             state_machine::GdbStubStateMachine::CtrlCInterrupt(dbg_inner) => dbg_inner
@@ -160,7 +151,7 @@ pub fn execute<V: Verifier, E: UserDefinedError, I: InstructionMeter>(
                                         SingleThreadStopReason::Exited(result.unwrap_or(0) as u8),
                                     )
                                     .unwrap();
-                                break 'outer result;
+                                break result;
                             }
                             _ => SingleThreadStopReason::Terminated(Signal::SIGSTOP),
                         };
@@ -201,21 +192,7 @@ pub fn execute<V: Verifier, E: UserDefinedError, I: InstructionMeter>(
             }
         };
     };
-    if interpreter
-        .vm
-        .verified_executable
-        .get_executable()
-        .get_config()
-        .enable_instruction_meter
-    {
-        interpreter
-            .instruction_meter
-            .consume(interpreter.due_insn_count);
-        interpreter.vm.total_insn_count =
-            interpreter.initial_insn_count - interpreter.instruction_meter.get_remaining();
-    }
-
-    Ok(result.unwrap_or(0))
+    finish_execution(interpreter, Some(result))
 }
 
 impl<'a, 'b, V: Verifier, E: UserDefinedError, I: InstructionMeter> Target
@@ -305,7 +282,7 @@ impl<'a, 'b, V: Verifier, E: UserDefinedError, I: InstructionMeter> SingleThread
                 // The debugger is sometimes requesting more data than we have access to, just skip these
                 _ => continue,
             };
-            *val = unsafe { *host_ptr as u8 };
+            *val = unsafe { *host_ptr };
         }
         Ok(())
     }

@@ -334,6 +334,7 @@ impl<E: UserDefinedError, I: InstructionMeter> Executable<E, I> {
             .ok_or(EbpfError::ElfError(ElfError::InvalidEntrypoint))
     }
 
+    /// Get the text section offset
     pub fn get_text_section_offset(&self) -> u64 {
         self.text_section_info.offset_range.start as u64
     }
